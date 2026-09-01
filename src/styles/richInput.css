@@ -1,0 +1,154 @@
+/* RichTextInput —— Plan_5_M6 contenteditable 富文本输入框 + 内联 atomic @token 样式。 */
+
+.rich-input {
+  flex: 1;
+  position: relative; /* ★ M6 验收 bug10：作为 placeholder ::before 绝对定位的锚点 */
+  min-height: 24px;
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 8px 12px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--syn-text-primary);
+  outline: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* 空态 placeholder（纯 CSS，data-empty 由 JS dataset 切换，不触发 React 重渲染）。
+   ★ M6 验收 bug10：绝对定位脱离内容流 + 单行省略——长文案不再换行把输入框撑高（容器保持 min-height:24px）。 */
+.rich-input[data-empty="true"]::before {
+  content: attr(data-placeholder);
+  position: absolute;
+  top: 8px;
+  left: 12px;
+  right: 12px;
+  color: var(--syn-text-muted);
+  pointer-events: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 细滚动条（与 app 风格统一）。 */
+.rich-input::-webkit-scrollbar { width: 8px; }
+.rich-input::-webkit-scrollbar-track { background: transparent; }
+.rich-input::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb, rgba(140, 140, 160, 0.4)); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
+.rich-input::-webkit-scrollbar-thumb:hover { background: var(--syn-text-muted); background-clip: padding-box; }
+
+/* 内联 atomic token：inline（非 inline-block，避基线/换行高度异常，P18）、不可选中、整体高亮。 */
+.rt-token {
+  display: inline;
+  padding: 1px 5px;
+  margin: 0 1px;
+  border-radius: 5px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ★ M6 验收 bug6：已发消息气泡里的只读 token chip——覆盖 .rt-token 的 user-select:none，让 @ 块能被选中复制。 */
+.rt-token-readonly {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* 七类配色（Phase 1 先接对话，其余为 Phase 2 预置）。 */
+.rt-token-conversation { background: rgba(124, 58, 237, 0.16); color: var(--syn-accent); }
+.rt-token-file        { background: rgba(59, 130, 246, 0.16); color: #3b82f6; }
+.rt-token-directory   { background: rgba(59, 130, 246, 0.16); color: #3b82f6; }
+.rt-token-workflow    { background: rgba(16, 185, 129, 0.16); color: #10b981; }
+.rt-token-mcp         { background: rgba(245, 158, 11, 0.18); color: #d97706; }
+.rt-token-terminal    { background: rgba(107, 114, 128, 0.20); color: var(--syn-text-secondary); }
+.rt-token-settings    { background: rgba(124, 58, 237, 0.16); color: var(--syn-accent); }
+/* #12a：/ 斜杠命令 chip——用玫红/粉色系，与 @ 七类（紫/蓝/绿/橙/灰）明显区分，凸显「命令=动作」语义。 */
+.rt-token-slash       { background: rgba(236, 72, 153, 0.16); color: #db2777; }
+
+/* ========== 两级 @ 类型菜单（AtTypeMenu，Plan_5_M6） ========== */
+/* 复用 .inline-completion-menu 的浮层定位 + .glass-panel 玻璃底；此处仅补两级菜单的差异样式。 */
+
+/* 一级类型列表：图标 + 名称。沿用 .cmd-item flex 行布局。 */
+.at-type-menu .at-type-item {
+  gap: 10px;
+}
+
+/* 类型图标：方形底色块，复用 .rt-token-* 七类配色（背景/字色同 token，视觉与插入后的 token 呼应）。 */
+.at-type-menu .at-type-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.at-type-menu .at-type-label {
+  flex: 1;
+  color: var(--syn-text);
+}
+
+/* 二级回退条：顶部「← 当前类型名」，点击回到一级。常驻在列表上方，带下分隔线。 */
+.at-type-menu .at-back-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin: 2px 4px 0;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--syn-text-secondary);
+  border-bottom: 1px solid var(--syn-border);
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  transition: background 0.1s, color 0.1s;
+}
+.at-type-menu .at-back-bar:hover {
+  background: var(--syn-bg-hover);
+  color: var(--syn-text);
+}
+.at-type-menu .at-back-arrow {
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.8;
+}
+.at-type-menu .at-back-label {
+  flex: 1;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 二级加载态：spinner + 「加载中…」。 */
+.at-type-menu .at-menu-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 18px 16px;
+  font-size: 13px;
+  color: var(--syn-text-muted);
+}
+.at-type-menu .at-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--syn-border);
+  border-top-color: var(--syn-accent);
+  border-radius: 50%;
+  animation: at-spin 0.7s linear infinite;
+}
+@keyframes at-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 二级空态：「无匹配」（复用 .cmd-empty，仅补一处微调钩子）。 */
+.at-type-menu .at-menu-empty {
+  padding: 18px 16px;
+}

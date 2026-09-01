@@ -1,0 +1,184 @@
+/* First Use Wizard */
+.wizard-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(8px);
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: fadeIn 300ms ease;
+}
+
+.window-titlebar ~ .wizard-overlay {
+  top: 34px;
+}
+
+.wizard-container {
+  width: 440px;
+  max-height: 90vh;
+  border-radius: 16px;
+  padding: 32px;
+  animation: slideUp 400ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.wizard-progress {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 24px;
+}
+
+.wizard-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--syn-overlay-strong);
+  transition: all 300ms;
+}
+
+.wizard-dot.active { background: var(--syn-accent); }
+.wizard-dot.current { width: 24px; border-radius: 4px; }
+
+.wizard-content {
+  text-align: center;
+  min-height: 240px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.wizard-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+}
+
+.wizard-title {
+  font-size: 20px;
+  color: var(--syn-text-primary);
+  margin-bottom: 16px;
+  font-weight: 600;
+}
+
+.wizard-body {
+  width: 100%;
+  font-size: 14px;
+  color: var(--syn-text-secondary);
+  line-height: 1.6;
+}
+
+.wizard-form-group {
+  margin: 12px 0;
+  text-align: left;
+}
+
+.wizard-form-group label {
+  display: block;
+  font-size: 12px;
+  color: var(--syn-text-muted);
+  margin-bottom: 4px;
+  font-weight: 500;
+}
+
+.wizard-input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--syn-border);
+  border-radius: 8px;
+  /* ★ 主题修复：原写死黑底输入框，浅色 glass-panel 内成深块。改用主题表层底 --syn-bg-elevated。 */
+  background: var(--syn-bg-elevated);
+  color: var(--syn-text-primary);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 200ms;
+}
+
+.wizard-input:focus {
+  border-color: var(--syn-accent);
+}
+
+.wizard-theme-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.wizard-theme-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 8px;
+  border: 2px solid transparent;
+  border-radius: 10px;
+  /* ★ 主题修复：主题选择卡片原写死黑底，浅色模式下成深块。改用主题表层底 + 叠加 hover/selected。 */
+  background: var(--syn-bg-elevated);
+  color: var(--syn-text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  transition: all 200ms;
+}
+
+.wizard-theme-btn:hover {
+  background: var(--syn-bg-hover);
+}
+
+.wizard-theme-btn.selected {
+  border-color: var(--theme-color);
+  background: var(--syn-bg-hover);
+  color: var(--syn-text-primary);
+}
+
+.wizard-theme-swatch {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.wizard-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 24px;
+}
+
+.wizard-btn {
+  padding: 8px 20px;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 200ms;
+}
+
+.wizard-btn.primary {
+  background: var(--syn-accent);
+  color: white;
+}
+
+.wizard-btn.primary:hover {
+  filter: brightness(1.1);
+}
+
+.wizard-btn.secondary {
+  background: var(--syn-bg-elevated);
+  color: var(--syn-text-secondary);
+}
+
+.wizard-btn.secondary:hover {
+  background: var(--syn-bg-hover);
+}

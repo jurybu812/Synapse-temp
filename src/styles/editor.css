@@ -1,0 +1,1905 @@
+/* PDF Viewer */
+.pdf-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  /* ★ 顺带修正历史遗留：--syn-bg 在本项目未定义（应为 --syn-bg-base），裸引用会回退透明。 */
+  background: var(--syn-bg, var(--syn-bg-base));
+}
+
+.pdf-viewer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 8px;
+  border-bottom: 1px solid var(--syn-border);
+  font-size: 13px;
+  color: var(--syn-text-secondary);
+}
+
+.pdf-viewer-toolbar button {
+  background: var(--syn-bg-elevated);
+  border: 1px solid var(--syn-border);
+  color: var(--syn-text-primary);
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.pdf-viewer-toolbar button:hover {
+  background: var(--syn-bg-hover);
+}
+
+.pdf-viewer-toolbar button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ★ FIX-9：阅读模式切换按钮选中态。 */
+.pdf-viewer-toolbar button.pdf-mode-active {
+  background: var(--syn-accent);
+  border-color: var(--syn-accent);
+  color: #fff;
+}
+
+.pdf-viewer-canvas-container {
+  flex: 1;
+  overflow: auto;
+  display: flex;
+  /* ★ FIX-11：放大后的页面可能比容器宽，flex 的 justify-content:center 会把溢出部分裁到
+     容器左侧、滚动条也够不到。改用 margin:auto 居中（见 .pdf-page-canvas），容器只负责滚动。 */
+  justify-content: flex-start;
+  padding: 16px;
+  /* ★ 主题修复：PDF 页底衬色——原写死 rgba(0,0,0,0.2)，浅色模式下成深块。改用 --syn-bg-base，
+     深色仍是近黑、浅色为浅灰，页面（白）与衬底都能区分。 */
+  background: var(--syn-bg-base);
+  /* ★ FIX-12：抓手光标——提示「可按住拖动平移」。拖动中切 grabbing（JS 加 .is-grabbing）。 */
+  cursor: grab;
+}
+.pdf-viewer-canvas-container.is-grabbing {
+  cursor: grabbing;
+  /* ★ FIX-12b：平移期间禁用文本/元素选择，避免拖拽出现蓝色选区高亮（平时不禁用，保留潜在选中需求）。 */
+  user-select: none;
+}
+
+/* ★ FIX-12（修「放大后看不见左右滚动条」真因）：全局滚动条仅 6px、thumb 为 rgba(255,255,255,0.12)，
+   压在本容器的半透明黑底上几乎不可见。PDF 是强依赖滚动导航的查看器，给它一套更宽、对比更高的专属滚动条，
+   横竖都清晰可见、易于拖动。 */
+.pdf-viewer-canvas-container::-webkit-scrollbar {
+  width: 14px;
+  height: 14px;
+}
+.pdf-viewer-canvas-container::-webkit-scrollbar-track {
+  background: var(--syn-overlay-scrim);
+}
+.pdf-viewer-canvas-container::-webkit-scrollbar-thumb {
+  /* ★ 主题修复：原写死白色 thumb，浅色衬底上不可见。改用主题滚动条色（深=浅白/浅=深灰），两套都清晰。 */
+  background: var(--scrollbar-thumb-hover);
+  border-radius: 7px;
+  /* 透明边框 + padding-box 裁切：让 thumb 视觉更细且与轨道留间距，但命中区域仍是整条，便于拖动。 */
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+.pdf-viewer-canvas-container::-webkit-scrollbar-thumb:hover {
+  background: var(--syn-text-muted);
+  background-clip: padding-box;
+}
+.pdf-viewer-canvas-container::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ★ FIX-11：canvas 的显示尺寸由 JS 按 scale 写到 style.width/height（真实放大）。
+   这里只负责：不被 flex 压缩（flex-shrink:0），小于容器时 margin:auto 居中、
+   大于容器时靠容器 overflow:auto 出滚动条且不被裁切。 */
+.pdf-page-canvas {
+  flex-shrink: 0;
+  margin: auto;
+  display: block;
+}
+
+/* ★ FIX-9：连续滚动模式——竖向堆叠多页。 */
+.pdf-scroll-container {
+  flex-direction: column;
+  /* 放大后页面可能比容器宽：用 flex-start 起始对齐，配合页元素 margin:auto 居中且不裁切。 */
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.pdf-scroll-page {
+  display: flex;
+  justify-content: flex-start;
+  /* 至少占满容器宽度（小页时撑开以便内部 margin:auto 居中），内容更宽时随内容增长。 */
+  min-width: 100%;
+  width: max-content;
+}
+
+.pdf-scroll-page canvas {
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+}
+
+.pdf-viewer-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--syn-text-muted);
+  font-size: 14px;
+}
+
+.pdf-viewer-error {
+  width: min(520px, calc(100% - 40px));
+  height: auto;
+  min-height: 120px;
+  margin: auto;
+  padding: 24px;
+  box-sizing: border-box;
+  border: 1px solid color-mix(in srgb, var(--syn-error, #ef4444) 45%, var(--syn-border));
+  border-radius: 12px;
+  background: var(--syn-bg-elevated, #1a1a25);
+  color: var(--syn-text-primary);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.28);
+  text-align: center;
+}
+
+/* Code Editor */
+.code-editor {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  /* ★ 玻璃化：原不透明 --syn-bg-code（暗 #0d1117 死黑 / 亮 #f6f8fa 死白）→ 高不透明「代码玻璃」
+     --glass-bg-code（深浅同源、0.88~0.90 alpha）+ backdrop-filter，摆脱死色又保证代码清晰可读。 */
+  background: var(--glass-bg-code);
+  backdrop-filter: blur(var(--glass-blur-code));
+  -webkit-backdrop-filter: blur(var(--glass-blur-code));
+}
+
+.code-editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  /* ★ 玻璃感统一：原 --syn-overlay-soft 叠在不透明代码底上（暗色太黑/亮色太白）→ 半透明玻璃底 + 模糊，
+     与 .glass-panel 同款，深浅由 --glass-bg 主题变量自适应。 */
+  border-bottom: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+}
+
+.code-editor-filename {
+  font-size: 12px;
+  color: var(--syn-text-primary);
+  font-weight: 500;
+}
+
+.code-editor-lang {
+  font-size: 10px;
+  color: var(--syn-text-muted);
+  text-transform: uppercase;
+  font-family: var(--syn-font-mono);
+}
+
+.code-editor-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+}
+
+.code-editor-btn {
+  background: none;
+  border: none;
+  color: var(--syn-text-muted);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+}
+
+.code-editor-btn:hover {
+  color: var(--syn-text-primary);
+  background: var(--syn-bg-hover);
+}
+
+.code-editor-content {
+  flex: 1;
+  overflow: auto;
+}
+
+.code-editor-pre {
+  padding: 12px;
+  margin: 0;
+  font-family: var(--syn-font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--syn-text-code);
+  tab-size: 2;
+}
+
+.code-editor-textarea {
+  width: 100%;
+  height: 100%;
+  padding: 12px;
+  margin: 0;
+  border: none;
+  background: transparent;
+  color: var(--syn-text-code);
+  font-family: var(--syn-font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  resize: none;
+  outline: none;
+  tab-size: 2;
+  white-space: pre;
+  overflow: auto;
+}
+
+/* ★ FIX-3：可编辑高亮——textarea 浮在高亮层上，二者填满 .code-editor-content。 */
+.code-editor-edit-wrap {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+/* 高亮层：绝对铺满，不接收鼠标事件（点击/选区都给上层 textarea），随 textarea 同步滚动。 */
+.code-editor-edit-highlight {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* 高亮层内 react-syntax-highlighter 产出的 pre：去掉自身滚动（滚动交给 textarea），
+   字号/行高/padding 必须与 textarea 完全一致，否则 caret 与高亮字符串位。 */
+.code-editor-edit-highlight pre,
+.code-editor-edit-highlight code {
+  margin: 0 !important;
+  background: transparent !important;
+  white-space: pre !important;
+  word-break: normal !important;
+}
+
+/* 叠加态 textarea：文字透明（只显 caret），让下方高亮层透出；caret 用浅色保证可见。 */
+.code-editor-textarea-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  color: transparent;
+  background: transparent;
+  caret-color: var(--syn-text-code);
+  -webkit-text-fill-color: transparent;
+}
+
+/* 选区仍要可见（透明文字下用半透明高亮块表达选中范围）。深浅各一套见 --syn-code-selection。 */
+.code-editor-textarea-overlay::selection {
+  background: var(--syn-code-selection);
+  -webkit-text-fill-color: transparent;
+}
+
+/* Drop Overlay */
+.welcome-page.dragging {
+  outline: 2px dashed var(--syn-accent);
+  outline-offset: -4px;
+}
+
+.welcome-drop-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(var(--syn-accent-rgb), 0.15);
+  backdrop-filter: blur(4px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  font-size: 14px;
+  color: var(--syn-accent);
+  gap: 8px;
+}
+
+.welcome-drop-icon {
+  font-size: 48px;
+}
+
+/* Recent workspace items */
+.welcome-recent-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 8px;
+  background: var(--syn-overlay-soft);
+  color: var(--syn-text-primary);
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+  font-size: 13px;
+  transition: background 150ms;
+}
+
+.welcome-recent-item:hover {
+  background: var(--syn-overlay-medium);
+}
+
+.recent-item-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.recent-item-name {
+  font-weight: 500;
+}
+
+.recent-item-time {
+  font-size: 11px;
+  color: var(--syn-text-muted);
+}
+
+.recent-item-delete {
+  opacity: 0;
+  background: none;
+  border: none;
+  color: var(--syn-text-muted);
+  cursor: pointer;
+  padding: 4px;
+  transition: opacity 150ms;
+}
+
+.welcome-recent-item:hover .recent-item-delete {
+  opacity: 1;
+}
+
+.recent-item-delete:hover {
+  color: var(--syn-error);
+}
+
+/* ============================================
+   Tab Bar — 参考 IDE 标签效果
+   ============================================ */
+.tab-strip {
+  display: flex;
+  align-items: stretch;
+  height: 36px;
+  min-height: 36px;
+  /* ★ 玻璃感统一：原不透明 --syn-bg-surface（暗色太黑/亮色太白）→ 与 .glass-panel 同款半透明玻璃底 + 模糊，
+     透出下层 .editor-area 玻璃，深浅由 --glass-bg 主题变量自适应。 */
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.tab-bar {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  flex: 1;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  padding: 0 4px;
+  gap: 1px;
+}
+
+.tab-scroll-btn {
+  width: 28px;
+  min-width: 28px;
+  border: 0;
+  border-right: 1px solid var(--syn-border);
+  border-bottom: 0;
+  background: var(--syn-overlay-soft);
+  color: var(--syn-text-muted);
+  cursor: pointer;
+}
+
+.tab-scroll-btn:last-child {
+  border-right: 0;
+  border-left: 1px solid var(--syn-border);
+}
+
+.tab-scroll-btn:hover,
+.tab-scroll-btn:focus-visible {
+  color: var(--syn-text-primary);
+  background: var(--syn-overlay-medium);
+}
+
+/* ★ M4-3-S8：标签栏右侧「...」更多操作按钮（VS Code 式 tab actions 入口）。 */
+.tab-more-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  min-width: 30px;
+  height: 100%;
+  border: 0;
+  border-left: 1px solid var(--syn-border);
+  background: var(--syn-overlay-soft);
+  color: var(--syn-text-muted);
+  cursor: pointer;
+  transition: color 120ms, background 120ms;
+}
+
+.tab-more-btn:hover,
+.tab-more-btn:focus-visible {
+  color: var(--syn-text-primary);
+  background: var(--syn-overlay-medium);
+}
+
+/* 菜单内禁用项（如 Show Opened Editors 分组标题）：弱化为非交互标题样式。 */
+.context-menu-item.disabled {
+  opacity: 0.55;
+  cursor: default;
+  font-weight: 600;
+  text-transform: none;
+}
+
+.context-menu-item.disabled:hover {
+  background: transparent;
+}
+
+.tab-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.tab-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 14px;
+  height: 100%;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--syn-text-muted);
+  border-bottom: 2px solid transparent;
+  border-top: 2px solid transparent;
+  background: transparent;
+  white-space: nowrap;
+  transition: background 120ms, color 120ms, border-color 120ms;
+  flex: 0 0 auto;
+  min-width: 112px;
+  max-width: 210px;
+  position: relative;
+}
+
+.tab-item:hover {
+  background: var(--syn-overlay-weak);
+  color: var(--syn-text-secondary);
+}
+
+.tab-item.active {
+  color: var(--syn-text-primary);
+  border-bottom-color: var(--syn-accent, #7c3aed);
+  background: var(--syn-overlay-soft);
+}
+
+.tab-item.preview .tab-label {
+  font-style: italic;
+}
+
+.tab-icon {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.tab-item.active .tab-icon {
+  opacity: 1;
+}
+
+/* File type icon colors */
+.tab-icon-pdf {
+  color: #ef4444;
+}
+
+.tab-icon-md {
+  color: #22c55e;
+}
+
+.tab-icon-docx {
+  color: #3b82f6;
+}
+
+.tab-icon-pptx {
+  color: #f97316;
+}
+
+.tab-icon-xlsx {
+  color: #10b981;
+}
+
+.tab-icon-py {
+  color: #3b82f6;
+}
+
+.tab-icon-js {
+  color: #eab308;
+}
+
+.tab-icon-ts {
+  color: #3b82f6;
+}
+
+.tab-icon-java {
+  color: #ef4444;
+}
+
+.tab-icon-cpp {
+  color: #8b5cf6;
+}
+
+.tab-icon-welcome {
+  color: var(--syn-accent);
+}
+
+.tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+
+.tab-dirty {
+  color: var(--syn-accent);
+  margin-left: 2px;
+}
+
+.tab-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: none;
+  color: var(--syn-text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 120ms, background 120ms;
+  flex-shrink: 0;
+  margin-left: 2px;
+}
+
+.tab-item:hover .tab-close {
+  opacity: 0.6;
+}
+
+.tab-close:hover {
+  opacity: 1 !important;
+  background: var(--syn-overlay-strong);
+  color: var(--syn-text-primary);
+}
+
+/* ============================================
+   DOCX Viewer
+   ============================================ */
+.docx-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+}
+
+.docx-viewer-loading,
+.docx-viewer-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--syn-text-muted);
+  font-size: 14px;
+  gap: 8px;
+}
+
+.docx-viewer-error .error-hint {
+  font-size: 12px;
+  color: var(--syn-text-muted);
+}
+
+.docx-content {
+  flex: 1;
+  overflow: auto;
+  padding: 24px 32px;
+  color: var(--syn-text-primary);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.docx-content h1,
+.docx-content h2,
+.docx-content h3 {
+  margin-top: 1.5em;
+}
+
+.docx-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1em 0;
+}
+
+.docx-content th,
+.docx-content td {
+  border: 1px solid var(--syn-border);
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.docx-content th {
+  background: var(--syn-overlay-weak);
+}
+
+.docx-content img {
+  max-width: 100%;
+  height: auto;
+}
+
+/* ============================================
+   PPTX Viewer
+   ============================================ */
+.pptx-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+}
+
+.office-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  min-width: 0;
+}
+
+.office-viewer .pdf-viewer {
+  flex: 1;
+  min-height: 0;
+}
+
+.office-viewer-loading,
+.office-viewer-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 24px;
+  color: var(--syn-text-muted);
+  gap: 8px;
+  text-align: center;
+}
+
+.office-viewer-loading span,
+.office-viewer-error span {
+  font-size: 32px;
+}
+
+.office-viewer-error pre {
+  max-width: min(720px, 90%);
+  max-height: 220px;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--syn-border);
+  border-radius: 8px;
+  /* ★ 玻璃化：错误详情代码面，从死色 --syn-bg-code → 高不透明代码玻璃。 */
+  background: var(--glass-bg-code);
+  backdrop-filter: blur(var(--glass-blur-code));
+  -webkit-backdrop-filter: blur(var(--glass-blur-code));
+  color: var(--syn-text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.pptx-outline {
+  flex: 1;
+  overflow: auto;
+  padding: 20px 28px;
+}
+
+.pptx-slide-card {
+  border: 1px solid var(--syn-border);
+  border-radius: 8px;
+  background: var(--syn-overlay-soft);
+  padding: 14px 18px;
+  margin-bottom: 14px;
+}
+
+.pptx-slide-card h3 {
+  margin: 0 0 10px;
+  color: var(--syn-text-primary);
+  font-size: 14px;
+}
+
+.pptx-slide-card ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--syn-text-secondary);
+  line-height: 1.7;
+}
+
+.viewer-muted {
+  color: var(--syn-text-muted);
+  font-size: 12px;
+}
+
+/* ============================================
+   Markdown Viewer
+   ============================================ */
+.markdown-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  container-type: inline-size;
+}
+
+.html-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+}
+
+.markdown-viewer-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--syn-text-muted);
+  font-size: 14px;
+}
+
+.markdown-content {
+  flex: 1;
+  overflow: auto;
+  padding: 24px 32px;
+  color: var(--syn-text-primary);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.markdown-content h1 {
+  font-size: 1.8em;
+  border-bottom: 1px solid var(--syn-border);
+  padding-bottom: 8px;
+}
+
+.markdown-content h2 {
+  font-size: 1.4em;
+  margin-top: 1.5em;
+}
+
+.markdown-content h3 {
+  font-size: 1.15em;
+  margin-top: 1.2em;
+}
+
+.markdown-content code {
+  background: var(--syn-overlay-medium);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+/* ★ 玻璃化：Markdown 代码块——原不透明 --syn-bg-code（暗死黑/亮死白）→ 高不透明代码玻璃
+   --glass-bg-code + backdrop-filter，文字密集故用高 alpha 保代码清晰。 */
+.markdown-content pre {
+  background: var(--glass-bg-code);
+  backdrop-filter: blur(var(--glass-blur-code));
+  -webkit-backdrop-filter: blur(var(--glass-blur-code));
+  color: var(--syn-text-code);
+  border: 1px solid var(--syn-border);
+  padding: 16px;
+  border-radius: 8px;
+  overflow-x: auto;
+}
+
+.markdown-content pre code {
+  background: none;
+  padding: 0;
+  color: inherit;
+}
+
+.markdown-content blockquote {
+  border-left: 3px solid var(--syn-accent);
+  padding-left: 16px;
+  margin-left: 0;
+  color: var(--syn-text-secondary);
+}
+
+.markdown-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1em 0;
+}
+
+.markdown-content th,
+.markdown-content td {
+  border: 1px solid var(--syn-border);
+  padding: 8px 12px;
+}
+
+.markdown-content th {
+  background: var(--syn-overlay-weak);
+}
+
+.markdown-content img {
+  max-width: 100%;
+  border-radius: 8px;
+}
+
+.split-viewer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  min-height: 0;
+  flex: 1;
+}
+
+.split-pane {
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--syn-border);
+}
+
+.split-pane:last-child {
+  border-right: none;
+}
+
+@container (max-width: 720px) {
+  .markdown-viewer .split-viewer {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(240px, 1fr) minmax(240px, 1fr);
+    overflow-y: auto;
+  }
+
+  .markdown-viewer .split-pane {
+    min-height: 240px;
+    border-right: none;
+    border-bottom: 1px solid var(--syn-border);
+  }
+
+  .markdown-viewer .split-pane:last-child {
+    border-bottom: none;
+  }
+}
+
+@container (max-width: 480px) {
+  .markdown-viewer .viewer-toolbar {
+    gap: 4px;
+    padding-inline: 8px;
+    flex-wrap: nowrap;
+  }
+
+  .markdown-viewer .viewer-filename {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .markdown-viewer .viewer-mode-tabs {
+    margin-left: 0;
+    flex: 0 0 auto;
+  }
+
+  .markdown-viewer .viewer-mode-tabs button {
+    width: 30px;
+    padding-inline: 0;
+    justify-content: center;
+    font-size: 0;
+  }
+
+  .markdown-viewer .markdown-content {
+    padding: 16px 14px;
+  }
+
+  .markdown-viewer .markdown-content table {
+    display: block;
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .markdown-viewer .markdown-content th,
+  .markdown-viewer .markdown-content td {
+    white-space: nowrap;
+  }
+}
+
+/* 渲染区舞台：作为 flex 子项占满，并为加载遮罩提供定位上下文。 */
+.html-preview-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  padding-top: 30px;
+}
+
+.html-preview-safety {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--syn-border);
+  background: var(--syn-overlay-soft);
+  color: var(--syn-text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.html-preview-safety svg {
+  flex: 0 0 auto;
+  color: var(--syn-success);
+}
+
+.html-preview-frame {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  border: none;
+  background: white;
+}
+
+/* iframe onLoad 前的加载遮罩：盖在 iframe 之上，onLoad 后淡出。 */
+.html-preview-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  /* ★ 修复：项目从未定义 --syn-bg（只有 --syn-bg-base/-surface/-elevated 等），裸引用回退到透明，
+     会让 z-index:2 的遮罩盖不住下层 background:white 的 iframe，onLoad 前白屏照样透出、淡出变成
+     「文字消失」而非「遮罩揭开」。改用已定义的 --syn-bg-base（暗/亮主题均有）保证遮罩真正不透明。 */
+  background: var(--syn-bg, var(--syn-bg-base));
+  color: var(--syn-text-muted);
+  font-size: 14px;
+  opacity: 1;
+  transition: opacity 260ms ease;
+}
+
+/* onLoad 后：淡出并停止接收事件，让 iframe 完全可交互。 */
+.html-preview-loading.is-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.html-preview-loading p {
+  margin: 0;
+  font-size: 14px;
+}
+
+.html-preview-loading small {
+  color: var(--syn-text-secondary);
+  font-size: 12px;
+  max-width: 80%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.html-preview-spinner {
+  color: var(--syn-accent);
+  animation: html-preview-spin 0.9s linear infinite;
+}
+
+@keyframes html-preview-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* ============================================
+   Shared Viewer Toolbar
+   ============================================ */
+.viewer-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  /* ★ 玻璃感统一：原 --syn-overlay-soft 叠在不透明 viewer 容器底（暗色太黑/亮色太白）→ 半透明玻璃底 + 模糊。 */
+  border-bottom: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  min-height: 32px;
+}
+
+.viewer-filename {
+  font-size: 12px;
+  color: var(--syn-text-primary);
+  font-weight: 500;
+}
+
+.viewer-mode-tabs {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.viewer-mode-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 26px;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--syn-text-muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.viewer-mode-tabs button:hover,
+.viewer-mode-tabs button.active {
+  border-color: var(--syn-border);
+  background: var(--syn-bg-hover);
+  color: var(--syn-text-primary);
+}
+
+/* ============================================
+   Editor Placeholder
+   ============================================ */
+.editor-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+
+.placeholder-content {
+  text-align: center;
+  color: var(--syn-text-primary);
+  padding: 24px;
+  border: 1px solid var(--syn-border);
+  border-radius: 12px;
+  background: var(--syn-bg-elevated, #1a1a25);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.24);
+}
+
+.placeholder-content p {
+  margin: 4px 0;
+  font-size: 14px;
+}
+
+.placeholder-hint {
+  font-size: 12px !important;
+  color: var(--syn-text-muted);
+  opacity: 0.9;
+  overflow-wrap: anywhere;
+}
+
+.html-preview-loading button {
+  min-height: 32px;
+  padding: 0 14px;
+  border: 1px solid var(--syn-border);
+  border-radius: 7px;
+  background: var(--syn-overlay-medium);
+  color: var(--syn-text-primary);
+  cursor: pointer;
+}
+
+.html-preview-loading button:hover,
+.html-preview-loading button:focus-visible {
+  border-color: var(--syn-accent);
+  outline: none;
+}
+
+.viewer-mode-tabs button:focus-visible,
+.tab-item:focus-visible {
+  outline: 2px solid var(--syn-accent);
+  outline-offset: -2px;
+}
+
+.unsupported-viewer {
+  max-width: 520px;
+  width: calc(100% - 40px);
+}
+
+/* ★ M4-3-S3：已发附件 attachment tab viewer。 */
+.attachment-tab-frame {
+  display: block;
+}
+
+.attachment-tab-text {
+  margin: 0;
+  padding: 16px;
+  height: 100%;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--syn-font-mono, monospace);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--syn-text-primary);
+  /* ★ 玻璃化：附件 TEXT 框（编辑器 tab 里打开纯文本/artifact）——原死色 --syn-bg-base → 高不透明代码玻璃，
+     文字密集故用高 alpha 保清晰。 */
+  background: var(--glass-bg-code);
+  backdrop-filter: blur(var(--glass-blur-code));
+  -webkit-backdrop-filter: blur(var(--glass-blur-code));
+}
+
+.attachment-tab-download {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--syn-border);
+  color: var(--syn-accent, #8b5cf6);
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.attachment-tab-download:hover {
+  background: var(--syn-bg-hover, rgba(255, 255, 255, 0.06));
+}
+
+/* ============================================
+   Welcome Page — 居中卡片布局
+   ============================================ */
+.welcome-page {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  min-height: 100%;
+  width: 100%;
+  overflow: auto;
+  position: relative;
+  padding: 24px 16px;
+}
+
+.welcome-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 32px;
+  max-width: 600px;
+  padding: 24px 32px 48px;
+  text-align: center;
+}
+
+.welcome-logo {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.welcome-emoji {
+  font-size: 56px;
+}
+
+.welcome-brand {
+  font-size: 36px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.gradient-text {
+  background: linear-gradient(135deg, var(--syn-primary), var(--syn-info), var(--syn-warning));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.welcome-tagline {
+  font-size: 15px;
+  color: var(--syn-text-secondary);
+  margin: 4px 0 0;
+}
+
+.welcome-actions-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  width: 100%;
+}
+
+.welcome-action-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 20px 16px;
+  border: 1px solid var(--syn-border);
+  border-radius: 12px;
+  background: var(--syn-overlay-soft);
+  color: var(--syn-text-primary);
+  cursor: pointer;
+  transition: all 200ms ease;
+  text-align: center;
+}
+
+.welcome-action-card:hover {
+  background: var(--syn-overlay-medium);
+  border-color: var(--action-accent, var(--syn-accent));
+  transform: translateY(-2px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+.welcome-action-card svg {
+  color: var(--action-accent, var(--syn-accent));
+}
+
+.action-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.action-desc {
+  font-size: 11px;
+  color: var(--syn-text-muted);
+  line-height: 1.4;
+}
+
+.welcome-recent {
+  width: 100%;
+  text-align: left;
+}
+
+.welcome-section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--syn-text-secondary);
+  margin: 0 0 12px;
+}
+
+.welcome-recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.welcome-recent-empty {
+  color: var(--syn-text-muted);
+  font-size: 13px;
+  padding: 12px 0;
+  text-align: center;
+}
+
+.welcome-tips {
+  font-size: 12px;
+  color: var(--syn-text-muted);
+  line-height: 1.8;
+}
+
+.welcome-tips p {
+  margin: 2px 0;
+}
+
+.welcome-tips kbd {
+  background: var(--syn-overlay-medium);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+  border: 1px solid var(--syn-overlay-strong);
+}
+
+/* ============================================
+   Image Viewer
+   ============================================ */
+.image-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  background: var(--syn-bg-base);
+}
+
+.viewer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  /* ★ 玻璃感统一：原 --syn-overlay-soft 叠在不透明 viewer 容器底（暗色太黑/亮色太白）→ 半透明玻璃底 + 模糊。 */
+  border-bottom: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+}
+
+.viewer-filename {
+  font-size: 12px;
+  color: var(--syn-text-primary);
+  font-weight: 500;
+}
+
+.viewer-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.viewer-controls button {
+  background: none;
+  border: none;
+  color: var(--syn-text-muted);
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+
+.viewer-controls button:hover {
+  color: var(--syn-text-primary);
+  background: var(--syn-bg-hover);
+}
+
+.viewer-scale {
+  font-size: 11px;
+  color: var(--syn-text-muted);
+  min-width: 35px;
+  text-align: center;
+  font-family: var(--syn-font-mono);
+}
+
+.image-canvas {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  padding: 16px;
+}
+
+.image-canvas img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  user-select: none;
+}
+
+/* ============================================
+   Review Changes
+   ============================================ */
+.review-changes-view {
+  height: 100%;
+  overflow: auto;
+  padding: 20px 28px;
+  background: var(--syn-bg-base);
+  color: var(--syn-text-primary);
+}
+
+/* ★ 反馈#2：单文件行内红绿 diff 视图（SingleDiffView）。复用 review-* 的行级红绿渲染样式，
+   只新增单文件容器/标题/操作区的布局。整体可滚动、贴 review 视图同款底色。 */
+.single-diff-view {
+  height: 100%;
+  overflow: auto;
+  padding: 16px 24px;
+  background: var(--syn-bg-base);
+  color: var(--syn-text-primary);
+}
+
+.single-diff-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--syn-border);
+  /* 标题/操作随内容滚动时仍贴顶，方便长 diff 下随时点接受/拒绝。 */
+  position: sticky;
+  top: -16px;
+  background: var(--syn-bg-base);
+  z-index: 1;
+}
+
+.single-diff-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+.single-diff-title-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.single-diff-title-text strong {
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.single-diff-title-text span {
+  font-size: 11px;
+  color: var(--syn-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.single-diff-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.single-diff-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--syn-border);
+  background: var(--syn-bg-elevated);
+  color: var(--syn-text-secondary);
+  cursor: pointer;
+}
+
+.single-diff-actions button:hover {
+  color: var(--syn-text-primary);
+  border-color: var(--syn-primary);
+}
+
+.single-diff-actions button.primary {
+  background: var(--syn-primary);
+  border-color: var(--syn-primary);
+  color: white;
+}
+
+.single-diff-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.review-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.review-header h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 650;
+}
+
+.review-header p {
+  margin: 4px 0 0;
+  color: var(--syn-text-muted);
+  font-size: 13px;
+}
+
+.review-header-actions,
+.review-file-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.review-header-actions button,
+.review-file-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--syn-border);
+  background: var(--syn-bg-elevated);
+  color: var(--syn-text-secondary);
+  cursor: pointer;
+}
+
+.review-header-actions button:hover,
+.review-file-actions button:hover {
+  color: var(--syn-text-primary);
+  border-color: var(--syn-primary);
+}
+
+.review-header-actions button:disabled,
+.review-file-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.review-header-actions button.primary,
+.review-file-actions button.primary {
+  background: var(--syn-primary);
+  border-color: var(--syn-primary);
+  color: white;
+}
+
+.review-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.review-file-card {
+  border: 1px solid var(--syn-border);
+  border-radius: 8px;
+  background: var(--syn-bg-elevated);
+  padding: 12px;
+}
+
+.review-file-card.status-accepted,
+.review-file-card.status-rejected {
+  opacity: 0.72;
+}
+
+.review-file-card.status-mixed {
+  border-color: rgba(245, 158, 11, 0.42);
+}
+
+.review-file-title {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.review-file-icon {
+  font-size: 16px;
+}
+
+.review-file-title strong,
+.review-file-title span {
+  min-width: 0;
+}
+
+.review-file-title strong {
+  display: block;
+  font-size: 14px;
+}
+
+.review-file-title div > span {
+  display: block;
+  margin-top: 2px;
+  color: var(--syn-text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.review-change-kind,
+.review-status {
+  font-size: 12px;
+  color: var(--syn-text-muted);
+}
+
+/* ★ 变更类型胶囊：新建=绿、删除=红、编辑=主题色，深浅模式靠半透明底自适应 */
+.review-change-kind {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 600;
+  white-space: nowrap;
+  background: var(--syn-overlay-weak);
+}
+
+.review-change-kind.kind-created {
+  color: var(--syn-success);
+  background: color-mix(in srgb, var(--syn-success) 16%, transparent);
+}
+
+.review-change-kind.kind-deleted {
+  color: var(--syn-error);
+  background: color-mix(in srgb, var(--syn-error) 16%, transparent);
+}
+
+.review-change-kind.kind-edited {
+  color: var(--syn-primary-light);
+  background: color-mix(in srgb, var(--syn-primary) 18%, transparent);
+}
+
+/* ★ 文件级状态胶囊：接受=绿 / 拒绝=红 / 部分=橙 */
+.review-status {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--syn-overlay-weak);
+}
+
+.review-status.status-accepted {
+  color: var(--syn-success);
+  background: color-mix(in srgb, var(--syn-success) 16%, transparent);
+}
+
+.review-status.status-rejected {
+  color: var(--syn-error);
+  background: color-mix(in srgb, var(--syn-error) 16%, transparent);
+}
+
+.review-status.status-mixed {
+  color: var(--syn-warning);
+  background: color-mix(in srgb, var(--syn-warning) 16%, transparent);
+}
+
+/* ★ +N/-N 突出徽标：对齐 IDE diff 标题角标——加大字号 + 高对比红绿底 */
+.review-lines-badge {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
+  border-radius: 6px;
+  overflow: hidden;
+  font-family: var(--syn-font-mono);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.review-lines {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+}
+
+.review-lines.added {
+  color: #3fb950;
+  background: color-mix(in srgb, #3fb950 22%, transparent);
+}
+
+.review-lines.removed {
+  color: #f85149;
+  background: color-mix(in srgb, #f85149 22%, transparent);
+}
+
+.review-file-actions {
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.review-batch-count {
+  color: var(--syn-primary-light);
+  font-size: 11px;
+}
+
+.review-batch-history {
+  margin-top: 8px;
+  border: 1px solid var(--syn-border);
+  border-radius: 6px;
+  background: var(--syn-overlay-weak);
+}
+
+.review-batch-history summary {
+  padding: 7px 9px;
+  color: var(--syn-text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.review-batch-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 10px;
+  padding: 6px 9px;
+  border-top: 1px solid var(--syn-border);
+  color: var(--syn-text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.review-conflict-note {
+  margin-top: 8px;
+  padding: 7px 9px;
+  border: 1px solid color-mix(in srgb, var(--syn-warning) 55%, var(--syn-border));
+  border-radius: 6px;
+  color: var(--syn-warning);
+  background: color-mix(in srgb, var(--syn-warning) 10%, transparent);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.review-group-partial-note {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--syn-warning) 35%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--syn-warning) 10%, transparent);
+  color: var(--syn-text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.review-snapshot-note {
+  margin-top: 8px;
+  color: var(--syn-text-muted);
+  font-size: 11px;
+  font-family: var(--syn-font-mono);
+}
+
+.review-diff-preview {
+  margin-top: 10px;
+  border: 1px solid var(--syn-border);
+  border-radius: 6px;
+  overflow: auto;
+  /* ★ 玻璃化：diff 预览是代码面，从死色 --syn-bg-code → 高不透明代码玻璃 + 模糊。 */
+  background: var(--glass-bg-code);
+  backdrop-filter: blur(var(--glass-blur-code));
+  -webkit-backdrop-filter: blur(var(--glass-blur-code));
+}
+
+.review-diff-hunk + .review-diff-hunk {
+  border-top: 1px solid var(--syn-border);
+}
+
+.review-diff-header {
+  padding: 4px 8px;
+  color: var(--syn-text-muted);
+  font-family: var(--syn-font-mono);
+  font-size: 11px;
+  background: var(--syn-overlay-weak);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.review-hunk-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: max-content;
+  font-family: var(--syn-font-sans);
+}
+
+.review-hunk-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--syn-border);
+  background: var(--syn-bg-elevated);
+  color: var(--syn-text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.review-hunk-actions button.primary {
+  background: var(--syn-primary);
+  border-color: var(--syn-primary);
+  color: white;
+}
+
+.review-hunk-status {
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--syn-overlay-weak);
+  color: var(--syn-text-muted);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.review-hunk-status.status-accepted {
+  color: var(--syn-success);
+}
+
+.review-hunk-status.status-rejected {
+  color: var(--syn-error);
+}
+
+.review-hunk-status.status-mixed {
+  color: var(--syn-warning);
+}
+
+.review-inline-block-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border-top: 1px solid var(--syn-overlay-weak);
+  border-bottom: 1px solid var(--syn-overlay-weak);
+  background: var(--syn-overlay-soft);
+  color: var(--syn-text-muted);
+  font-family: var(--syn-font-mono);
+  font-size: 11px;
+  min-width: max-content;
+}
+
+/* ★ IDE 风格 diff 行：旧行号 | 新行号 | 符号 | 内容 四列 */
+.review-diff-line {
+  display: grid;
+  grid-template-columns: 44px 44px 16px minmax(0, 1fr);
+  gap: 0;
+  padding: 0 8px 0 0;
+  font-family: var(--syn-font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  min-width: max-content;
+  width: 100%;
+}
+
+/* ★ 行号列：右对齐、弱色、不可选，跟 IDE 行号槽一致 */
+.review-line-no {
+  display: inline-block;
+  width: 44px;
+  padding: 0 8px 0 0;
+  text-align: right;
+  color: var(--syn-text-muted);
+  opacity: 0.7;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.review-diff-sign {
+  display: inline-block;
+  text-align: center;
+  color: var(--syn-text-muted);
+}
+
+.review-diff-line code {
+  padding-left: 6px;
+  overflow: visible;
+  white-space: pre;
+  text-overflow: clip;
+}
+
+/* ★ 新增行：绿底 + 左侧绿色竖条强化（对齐 IDE 增行视觉） */
+.review-diff-line.add {
+  background: color-mix(in srgb, #3fb950 14%, transparent);
+  box-shadow: inset 3px 0 0 #3fb950;
+}
+
+/* ★ 删除行：红底 + 左侧红色竖条强化 */
+.review-diff-line.delete {
+  background: color-mix(in srgb, #f85149 14%, transparent);
+  box-shadow: inset 3px 0 0 #f85149;
+}
+
+.review-diff-line.add .review-diff-sign {
+  color: #3fb950;
+  font-weight: 700;
+}
+
+.review-diff-line.delete .review-diff-sign {
+  color: #f85149;
+  font-weight: 700;
+}
+
+@media (max-width: 900px) {
+  .review-diff-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .review-hunk-actions {
+    flex-wrap: wrap;
+  }
+
+  .review-inline-block-bar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+.review-empty {
+  padding: 40px;
+  text-align: center;
+  color: var(--syn-text-muted);
+}

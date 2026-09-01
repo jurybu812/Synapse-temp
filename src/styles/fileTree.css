@@ -1,0 +1,343 @@
+/* ============================================
+   Search Panel (★ FIX-4)
+   ============================================ */
+
+.search-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+}
+
+.search-input-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.search-input-icon {
+  position: absolute;
+  left: 8px;
+  color: var(--syn-text-muted);
+  pointer-events: none;
+}
+
+.search-input {
+  width: 100%;
+  padding: 6px 26px 6px 28px;
+  font-size: 13px;
+  color: var(--syn-text-primary);
+  background: var(--syn-bg-elevated);
+  border: 1px solid var(--syn-border);
+  border-radius: 6px;
+  outline: none;
+}
+
+.search-input:focus {
+  border-color: var(--syn-accent);
+}
+
+.search-clear-btn {
+  position: absolute;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  background: none;
+  border: none;
+  color: var(--syn-text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.search-clear-btn:hover {
+  color: var(--syn-text-primary);
+  background: var(--syn-bg-hover);
+}
+
+.search-status {
+  font-size: 12px;
+  color: var(--syn-text-muted);
+  padding: 4px 6px;
+}
+
+.search-results {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.search-group-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--syn-text-muted);
+  padding: 4px 6px 2px;
+}
+
+.search-result-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--syn-text-secondary);
+  overflow: hidden;
+}
+
+.search-result-item:hover {
+  background: var(--syn-bg-hover);
+}
+
+.search-result-icon {
+  flex-shrink: 0;
+  color: var(--syn-text-muted);
+}
+
+.search-result-name {
+  font-size: 13px;
+  color: var(--syn-text-primary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.search-result-line {
+  color: var(--syn-text-muted);
+  font-family: var(--syn-font-mono);
+  font-size: 11px;
+}
+
+.search-result-path {
+  font-size: 11px;
+  color: var(--syn-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+
+.search-result-content {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.search-result-snippet {
+  font-size: 11px;
+  font-family: var(--syn-font-mono);
+  color: var(--syn-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  width: 100%;
+}
+
+/* ============================================
+   FileTree & Context Menu Styles
+   ============================================ */
+
+.file-tree {
+  position: relative;
+  min-height: 100%;
+  font-size: 13px;
+  user-select: none;
+}
+
+.workspace-recovery {
+  padding: 18px;
+}
+
+.workspace-recovery > svg {
+  color: var(--syn-warning, #e5a12a);
+  opacity: 0.82;
+}
+
+.workspace-recovery p {
+  margin: 0;
+  color: var(--syn-text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.workspace-recovery small {
+  max-width: 240px;
+  color: var(--syn-text-secondary);
+  line-height: 1.5;
+}
+
+.workspace-recovery-action {
+  min-height: 30px;
+  padding: 6px 12px;
+  border: 1px solid color-mix(in srgb, var(--syn-accent) 58%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--syn-accent) 12%, transparent);
+  color: var(--syn-text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.workspace-recovery-action:hover {
+  background: color-mix(in srgb, var(--syn-accent) 20%, transparent);
+}
+
+.workspace-recovery-action:focus-visible {
+  outline: 2px solid var(--syn-accent);
+  outline-offset: 2px;
+}
+
+.file-tree-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background var(--syn-transition-fast);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.file-tree-item:hover {
+  background: var(--syn-bg-hover);
+}
+
+.file-tree-item:focus-visible {
+  outline: 2px solid var(--syn-accent);
+  outline-offset: -2px;
+  background: var(--syn-bg-hover);
+}
+
+.file-tree-item.is-dir .tree-name {
+  font-weight: 500;
+}
+
+.tree-chevron {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  color: var(--syn-text-muted);
+  width: 14px;
+}
+
+.tree-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  line-height: 1;
+}
+
+/* ★ M4-3-S6：彩色 SVG 图标统一尺寸与垂直对齐（内置 material-icon-theme 风格子集）。 */
+.tree-icon svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+.tree-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--syn-text-primary);
+}
+
+.tree-size {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--syn-text-muted);
+  margin-left: 8px;
+}
+
+.tree-children {
+  /* Indent handled by paddingLeft in JS component */
+  display: contents;
+}
+
+/* Context Menu */
+.context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 200px;
+  width: max-content;
+  padding: 4px;
+  border-radius: 8px;
+  animation: contextMenuIn 120ms ease-out;
+}
+
+@keyframes contextMenuIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 12px;
+  border: none;
+  background: transparent;
+  color: var(--syn-text-primary);
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 4px;
+  text-align: left;
+  white-space: nowrap;
+  transition: background var(--syn-transition-fast);
+}
+
+.context-menu-item:hover {
+  background: var(--syn-bg-hover);
+}
+
+.context-menu-item.danger {
+  color: var(--syn-error);
+}
+
+.context-menu-item.danger:hover {
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.context-menu-divider,
+.context-menu-separator {
+  height: 1px;
+  background: var(--syn-border);
+  margin: 4px 8px;
+}
+
+/* Drag & Drop Zone */
+.drop-zone {
+  border: 2px dashed var(--syn-border);
+  border-radius: 8px;
+  padding: 24px;
+  text-align: center;
+  transition: all var(--syn-transition-fast);
+}
+
+.drop-zone.drag-over {
+  border-color: var(--syn-primary);
+  background: rgba(var(--syn-accent-rgb), 0.08);
+}
+
+.drop-zone-text {
+  color: var(--syn-text-muted);
+  font-size: 12px;
+}

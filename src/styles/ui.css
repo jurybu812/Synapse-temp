@@ -1,0 +1,152 @@
+/* ========== Toast 通知 ========== */
+.toast-container {
+  position: fixed; bottom: 116px; right: 16px;
+  display: flex; flex-direction: column-reverse; gap: 8px;
+  z-index: 1000; max-width: 380px;
+  pointer-events: none;
+}
+
+.toast-item {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 12px 14px;
+  background: var(--syn-bg-secondary);
+  border: 1px solid var(--syn-border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+  animation: toast-slide-in 0.3s ease;
+  pointer-events: none;
+  backdrop-filter: blur(12px);
+}
+
+.toast-info    { border-left: 3px solid #3b82f6; }
+.toast-success { border-left: 3px solid #10b981; }
+.toast-warning { border-left: 3px solid #f59e0b; }
+.toast-error   { border-left: 3px solid #ef4444; }
+.toast-progress { border-left: 3px solid var(--syn-accent); }
+
+.toast-icon { padding-top: 2px; flex-shrink: 0; }
+.toast-info .toast-icon { color: #3b82f6; }
+.toast-success .toast-icon { color: #10b981; }
+.toast-warning .toast-icon { color: #f59e0b; }
+.toast-error .toast-icon { color: #ef4444; }
+.toast-progress .toast-icon { color: var(--syn-accent); }
+
+.toast-spinner { animation: spin 1s linear infinite; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+.toast-body { flex: 1; min-width: 0; }
+.toast-title { font-size: 13px; font-weight: 600; color: var(--syn-text); display: block; }
+.toast-message { font-size: 12px; color: var(--syn-text-secondary); margin-top: 2px; display: block; }
+
+.toast-progress-bar {
+  height: 4px; background: var(--syn-bg-tertiary); border-radius: 2px;
+  margin-top: 8px; overflow: hidden;
+}
+.toast-progress-fill {
+  height: 100%; background: var(--syn-accent); border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.toast-dismiss {
+  background: none; border: none; color: var(--syn-text-secondary);
+  cursor: pointer; padding: 2px; border-radius: 4px; flex-shrink: 0;
+  pointer-events: auto;
+}
+.toast-dismiss:hover { background: var(--syn-bg-hover); color: var(--syn-text); }
+
+@keyframes toast-slide-in {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+/* ========== 命令面板 ========== */
+.cmd-palette-overlay {
+  position: fixed; inset: 0; z-index: 2000;
+  background: rgba(0,0,0,0.5); backdrop-filter: blur(4px);
+  display: flex; justify-content: center; padding-top: 15vh;
+}
+
+.cmd-palette {
+  width: 520px; max-height: 400px;
+  background: var(--syn-bg-secondary);
+  border: 1px solid var(--syn-border);
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+
+.cmd-input-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--syn-border);
+  color: var(--syn-text-secondary);
+}
+
+.cmd-input {
+  flex: 1; background: none; border: none; outline: none;
+  font-size: 14px; color: var(--syn-text);
+}
+.cmd-input::placeholder { color: var(--syn-text-muted); }
+
+.cmd-list {
+  flex: 1; overflow-y: auto; padding: 4px;
+}
+
+.cmd-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-radius: 6px;
+  cursor: pointer; font-size: 13px;
+  color: var(--syn-text-secondary);
+  transition: background 0.1s;
+}
+.cmd-item:hover, .cmd-item.selected {
+  background: var(--syn-bg-hover); color: var(--syn-text);
+}
+.cmd-label { flex: 1; color: var(--syn-text); }
+.cmd-category { font-size: 11px; opacity: 0.5; }
+.cmd-shortcut {
+  font-size: 11px; padding: 2px 6px;
+  background: var(--syn-bg-tertiary); border: 1px solid var(--syn-border);
+  border-radius: 4px; font-family: monospace;
+}
+.cmd-empty { padding: 16px; text-align: center; color: var(--syn-text-muted); font-size: 13px; }
+
+/* ========== 输入区内联补全浮层（M4-6-S1） ========== */
+/* 复用 .cmd-item / .cmd-list 视觉，定位为输入框上方的相对浮层（非全屏 overlay）。 */
+.inline-completion-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 50;
+  max-height: 280px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--syn-bg-secondary);
+  border: 1px solid var(--syn-border);
+  border-radius: 10px;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.35);
+}
+
+.inline-completion-menu .cmd-list {
+  max-height: 280px;
+  padding: 4px;
+}
+
+.inline-completion-group {
+  padding: 6px 12px 2px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--syn-text-muted);
+  letter-spacing: 0.02em;
+}
+
+.inline-completion-desc {
+  flex: 0 1 auto;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

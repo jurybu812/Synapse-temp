@@ -1,0 +1,559 @@
+/* ConversationList styles */
+.conversation-list {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 8px;
+}
+
+.conversation-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 4px;
+  margin-bottom: 8px;
+}
+
+.conversation-list-header h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--syn-text);
+  margin: 0;
+}
+
+.conv-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.conv-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  color: var(--syn-text);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.conv-icon-btn:hover,
+.conv-icon-btn.active {
+  background: var(--syn-accent);
+  color: white;
+}
+
+/* Search bar */
+.conv-search-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  background: var(--syn-overlay-weak);
+  border: 1px solid var(--syn-border);
+  transition: border-color 0.2s;
+}
+
+.conv-search-bar:focus-within {
+  border-color: var(--syn-accent);
+}
+
+.conv-search-icon {
+  flex-shrink: 0;
+  color: var(--syn-text-muted);
+}
+
+.conv-search-input {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--syn-text);
+  font-size: 12px;
+  min-width: 0;
+}
+
+.conv-search-input::placeholder {
+  color: var(--syn-text-muted);
+  opacity: 0.6;
+}
+
+.conv-search-clear {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--syn-text-muted);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.conv-search-clear:hover {
+  color: var(--syn-text);
+  background: var(--syn-overlay-strong);
+}
+
+.conv-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.conv-filter-select,
+.conv-tag-filter {
+  min-width: 0;
+  height: 28px;
+  border: 1px solid var(--syn-border);
+  border-radius: 6px;
+  background: var(--syn-overlay-weak);
+  color: var(--syn-text);
+  font-size: 11px;
+}
+
+.conv-filter-select {
+  flex: 0 0 84px;
+  padding: 0 6px;
+}
+
+.conv-tag-filter {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  color: var(--syn-text-muted);
+}
+
+.conv-tag-filter input {
+  min-width: 0;
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--syn-text);
+  font-size: 11px;
+}
+
+.conv-bulk-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  margin-bottom: 8px;
+  border-radius: 8px;
+}
+
+.conv-bulk-topline,
+.conv-bulk-actions,
+.conv-bulk-tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.conv-bulk-topline span {
+  margin-left: auto;
+  color: var(--syn-text-muted);
+  font-size: 11px;
+}
+
+.conv-small-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 24px;
+  padding: 3px 7px;
+  border: 1px solid var(--syn-border);
+  border-radius: 6px;
+  background: var(--syn-overlay-weak);
+  color: var(--syn-text);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.conv-small-btn:hover:not(:disabled) {
+  border-color: rgba(var(--syn-accent-rgb, 139, 92, 246), 0.5);
+  background: rgba(var(--syn-accent-rgb, 139, 92, 246), 0.16);
+}
+
+.conv-small-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.conv-small-btn.danger:hover:not(:disabled) {
+  border-color: rgba(239, 68, 68, 0.45);
+  background: rgba(239, 68, 68, 0.14);
+  /* ★ P1 主题修复：原 #fecaca 浅红字在浅色背景上几乎不可见。改用语义 error 色，深浅都清晰。 */
+  color: var(--syn-error);
+}
+
+.conv-bulk-tags input {
+  flex: 1;
+  min-width: 110px;
+  height: 24px;
+  padding: 2px 7px;
+  border: 1px solid var(--syn-border);
+  border-radius: 6px;
+  background: var(--syn-overlay-weak);
+  color: var(--syn-text);
+  font-size: 11px;
+  outline: none;
+}
+
+.conversation-list-items {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.conv-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+  color: var(--syn-text-muted);
+  text-align: center;
+  gap: 8px;
+}
+
+.conv-empty p {
+  margin: 0;
+  font-size: 13px;
+}
+
+.conv-hint {
+  font-size: 11px !important;
+  opacity: 0.6;
+}
+
+.conv-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 78px 10px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  position: relative;
+  min-width: 0;
+}
+
+.conv-item:hover {
+  background: var(--syn-overlay-medium);
+}
+
+.conv-item.active {
+  background: rgba(var(--syn-accent-rgb, 139, 92, 246), 0.2);
+  border-left: 2px solid var(--syn-accent);
+}
+
+.conv-item.selected {
+  outline: 1px solid rgba(var(--syn-accent-rgb, 139, 92, 246), 0.6);
+}
+
+.conv-item-icon,
+.conv-select-btn {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--syn-text-muted);
+}
+
+.conv-select-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.conv-item-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.conv-item-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--syn-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conv-title-input {
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  padding: 2px 6px;
+  border: 1px solid var(--syn-accent);
+  border-radius: 5px;
+  background: var(--syn-overlay-medium);
+  color: var(--syn-text);
+  font-size: 13px;
+  font-weight: 500;
+  outline: none;
+}
+
+.conv-item-preview {
+  font-size: 11px;
+  color: var(--syn-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conv-item-meta {
+  display: flex;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--syn-text-muted);
+  opacity: 0.6;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.conv-tags {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  flex-wrap: wrap;
+  max-height: 40px;
+}
+
+.conv-tag {
+  max-width: 96px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(var(--syn-accent-rgb, 139, 92, 246), 0.15);
+  color: var(--syn-text);
+  font-size: 10px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.conv-tag.archived {
+  background: rgba(245, 158, 11, 0.16);
+  /* ★ P1 主题修复：原 #fbbf24 浅黄字在浅底上对比不足。改用更深的 warning 色，浅底深底都可读。 */
+  color: var(--syn-warning);
+}
+
+.conv-tag.muted {
+  background: var(--syn-overlay-medium);
+  color: var(--syn-text-muted);
+}
+
+/* Action buttons (export + delete) */
+.conv-item-actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.2s;
+  max-width: 104px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.conv-item:hover .conv-item-actions,
+.conv-item:focus-within .conv-item-actions {
+  opacity: 1;
+}
+
+.conv-item-action {
+  background: none;
+  border: none;
+  color: var(--syn-text-muted);
+  cursor: pointer;
+  padding: 3px;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.conv-item-action:hover {
+  color: var(--syn-text);
+  background: var(--syn-overlay-strong);
+}
+
+.conv-item-action.danger:hover {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.conv-item-action.active {
+  color: var(--syn-text);
+  background: rgba(var(--syn-accent-rgb, 139, 92, 246), 0.2);
+}
+
+/* ★ M4-2-S6 工作区范围切换器 */
+.conv-scope-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.conv-scope-icon {
+  flex-shrink: 0;
+  color: var(--syn-text-muted);
+}
+
+.conv-scope-tabs {
+  display: flex;
+  flex: 1;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  background: var(--syn-overlay-weak);
+  border: 1px solid var(--syn-border);
+}
+
+.conv-scope-tab {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--syn-text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.conv-scope-tab:hover {
+  color: var(--syn-text);
+  background: var(--syn-overlay-medium);
+}
+
+.conv-scope-tab.active {
+  color: var(--syn-text);
+  background: rgba(var(--syn-accent-rgb, 139, 92, 246), 0.24);
+}
+
+/* ★ M4-2-S6 所属工作区小标记（conv-item-meta 内） */
+.conv-ws-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 96px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgba(var(--syn-accent-rgb, 139, 92, 246), 0.14);
+  color: var(--syn-text);
+  opacity: 0.85;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.conv-ws-badge.global {
+  background: var(--syn-overlay-medium);
+  color: var(--syn-text-muted);
+}
+
+.conv-ws-badge svg {
+  flex-shrink: 0;
+}
+
+/* ★ M4-2-S6「移动到…」内联菜单 */
+.conv-move-menu {
+  position: absolute;
+  top: 30px;
+  right: 8px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 150px;
+  max-width: 220px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 6px;
+  border-radius: 8px;
+}
+
+.conv-move-menu-title {
+  padding: 2px 6px 4px;
+  font-size: 10px;
+  color: var(--syn-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.conv-move-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--syn-text-secondary, var(--syn-text));
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.conv-move-option:hover,
+.conv-move-option.active {
+  background: rgba(var(--syn-accent-rgb, 139, 92, 246), 0.16);
+  color: var(--syn-text);
+}
+
+.conv-move-option svg {
+  flex-shrink: 0;
+}
+
+.conv-move-option-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.conv-move-option small {
+  flex-shrink: 0;
+  font-size: 9px;
+  color: var(--syn-text-muted);
+}
+
+.conv-move-empty {
+  padding: 8px;
+  font-size: 11px;
+  color: var(--syn-text-muted);
+  text-align: center;
+}

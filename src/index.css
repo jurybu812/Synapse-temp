@@ -1,0 +1,309 @@
+@import "tailwindcss";
+
+/* ============================================
+   Synapse Design System — CSS Variables
+   ============================================ */
+
+:root {
+  /* --- Core Colors (Violet Theme) --- */
+  --syn-primary: #7c3aed;
+  --syn-primary-hover: #6d28d9;
+  --syn-primary-light: #a78bfa;
+  --syn-accent: #06b6d4;
+  --syn-accent-rgb: 6, 182, 212;
+
+  /* --- Background Colors --- */
+  --syn-bg-base: #0a0a0f;
+  --syn-bg-surface: #111118;
+  --syn-bg-surface-rgb: 17, 17, 24;
+  --syn-bg-elevated: #1a1a25;
+  --syn-bg-hover: #252535;
+  --syn-bg-secondary: var(--syn-bg-surface);
+  --syn-bg-tertiary: var(--syn-bg-elevated);
+
+  /* --- Text Colors --- */
+  --syn-text-primary: #e2e8f0;
+  --syn-text-secondary: #94a3b8;
+  --syn-text-muted: #64748b;
+  --syn-text-inverse: #0f172a;
+  --syn-text: var(--syn-text-primary);
+
+  /* --- Border Colors --- */
+  --syn-border: rgba(255, 255, 255, 0.08);
+  --syn-border-focused: rgba(124, 58, 237, 0.5);
+
+  /* --- Glassmorphism System --- */
+  --glass-bg: rgba(17, 17, 24, 0.75);
+  /* ★ 主题修复：近不透明玻璃底——浮层/菜单/对话切换器专用，防半透明透出底层文字重叠（深浅各一套，见浅色块）。 */
+  --glass-bg-solid: rgba(22, 22, 32, 0.97);
+  --glass-border: rgba(255, 255, 255, 0.06);
+  --glass-blur: 12px;
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+
+  /* --- Code Surface（代码编辑器/代码块专用底色 + 文字，深浅各一套，见浅色块） ---
+     深色：GitHub Dark 风 #0d1117 底 / #c9d1d9 字；选区高亮蓝 #58a6ff。 */
+  --syn-bg-code: #0d1117;
+  --syn-text-code: #c9d1d9;
+  --syn-code-selection: rgba(88, 166, 255, 0.35);
+
+  /* --- Glass Surfaces：文字密集区专用「高不透明玻璃」（深浅各一套，见浅色块） ---
+     权衡：代码块/代码编辑区/终端/输入框有大量文字，纯透明会被壁纸干扰看不清。
+     ★ 关键（M7 第五轮修正）：壁纸模式下 .editor-area/.agent-panel 本身已是 0.75 半透明玻璃，叶子（代码区/终端/
+     代码块/输入框）若再叠 0.88 高 alpha = 双层叠加，壁纸透出率仅 0.25×0.12≈3% → 几乎死黑（主人「不够透」真因）。
+     故叶子改用【低 alpha】，叠在 0.75 面板上总不透明约 0.85（代码仍清晰）+ 透出约 15% 壁纸（明显玻璃感），配 backdrop 模糊。
+     · --glass-bg-code：代码面（深 #0d1117 / 浅 #f6f8fa 同源），给代码块/编辑区/终端。
+     · --glass-bg-input：输入框/建议按钮等交互面，更透一点。 */
+  --glass-bg-code: rgba(13, 17, 23, 0.42);
+  --glass-bg-input: rgba(26, 26, 37, 0.25);
+  /* ★ 第五轮修正：叶子模糊跟随用户「窗口模糊」总开关 --glass-blur，而非固定 14px——主人关模糊(0)时
+     叶子也不模糊，既省多层 backdrop-filter 合成开销（偶发卡顿+截图超时元凶）、又让壁纸清晰透出（更通透）。 */
+  --glass-blur-code: var(--glass-blur);
+
+  /* --- Overlay 叠加层（提亮/压暗，深浅各一套）---
+     深色用「白色提亮」，浅色用「黑色压暗」，保证 hover/选中/分隔在两套主题下都有正确对比。 */
+  --syn-overlay-soft: rgba(255, 255, 255, 0.03);   /* 极弱：工具栏/卡片底微提 */
+  --syn-overlay-weak: rgba(255, 255, 255, 0.05);   /* 弱：表头/胶囊底 */
+  --syn-overlay-medium: rgba(255, 255, 255, 0.08); /* 中：hover / kbd / 输入底 */
+  --syn-overlay-strong: rgba(255, 255, 255, 0.12); /* 强：active 关闭键 hover */
+  --syn-overlay-scrim: rgba(0, 0, 0, 0.3);         /* 半透明压暗：模态遮罩/代码区底兜底 */
+
+  /* --- Panel Sizes --- */
+  --activity-bar-width: 42px;
+  --status-bar-height: 24px;
+
+  /* --- Typography --- */
+  --syn-font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --syn-font-mono: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+  --app-font-size: 14px;
+
+  /* --- Transitions --- */
+  --syn-transition-fast: 150ms ease;
+  --syn-transition-normal: 250ms ease;
+  --syn-transition-slow: 400ms ease;
+
+  /* --- Semantic Colors --- */
+  --syn-success: #22c55e;
+  --syn-warning: #f59e0b;
+  --syn-error: #ef4444;
+  --syn-info: #3b82f6;
+
+  /* --- Scrollbar --- */
+  --scrollbar-width: 8px;
+  --scrollbar-thumb: rgba(255, 255, 255, 0.15);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.25);
+}
+
+:root[data-theme='light'] {
+  --syn-bg-base: #f6f7fb;
+  --syn-bg-surface: #ffffff;
+  --syn-bg-surface-rgb: 255, 255, 255;
+  --syn-bg-elevated: #eef1f7;
+  --syn-bg-hover: #e4e8f2;
+  --syn-bg-secondary: var(--syn-bg-surface);
+  --syn-bg-tertiary: var(--syn-bg-elevated);
+  --syn-text-primary: #111827;
+  --syn-text-secondary: #475569;
+  --syn-text-muted: #64748b;
+  --syn-text-inverse: #ffffff;
+  --syn-text: var(--syn-text-primary);
+  --syn-border: rgba(15, 23, 42, 0.12);
+  /* ★ 主题修复（根因）：浅色模式必须覆盖 --glass-bg——原只在 :root 定义深色，导致所有 glass-panel 浮层
+     在浅色模式仍是深底，配浅色深字看不清。glass-bg-solid 同理覆盖为浅色近不透明底。 */
+  --glass-bg: rgba(255, 255, 255, 0.78);
+  --glass-bg-solid: rgba(255, 255, 255, 0.97);
+  --glass-border: rgba(15, 23, 42, 0.08);
+  --glass-shadow: 0 8px 32px rgba(15, 23, 42, 0.12);
+  --scrollbar-thumb: rgba(15, 23, 42, 0.18);
+  --scrollbar-thumb-hover: rgba(15, 23, 42, 0.28);
+
+  /* ★ 浅色代码主题：GitHub Light 风——#f6f8fa 浅底 + #24292f 近黑字，高可读且不刺眼。
+     语法高亮 token 颜色由 CodeEditor 切到 Prism `vs`（VS Code Light）主题承担；
+     此处仅管代码「容器底色 + 基础字色 + 选区」，供 .code-editor / .code-block / 裸 pre 共用。 */
+  --syn-bg-code: #f6f8fa;
+  --syn-text-code: #24292f;
+  --syn-code-selection: rgba(84, 174, 255, 0.30);
+
+  /* ★ 浅色文字密集区玻璃（对应深色块 --glass-bg-code / --glass-bg-input）：
+     代码面用 GitHub Light 浅底 #f6f8fa 同源高 alpha，输入面用 elevated 浅底 #eef1f7 同源。
+     浅色下 alpha 略高一点点（白底壁纸透色更刺眼），保证代码/文字清晰。 */
+  --glass-bg-code: rgba(246, 248, 250, 0.55);
+  --glass-bg-input: rgba(238, 241, 247, 0.42);
+
+  /* 浅色 Overlay：改用「黑色压暗」，否则白底上叠白色提亮等于不可见。 */
+  --syn-overlay-soft: rgba(15, 23, 42, 0.035);
+  --syn-overlay-weak: rgba(15, 23, 42, 0.05);
+  --syn-overlay-medium: rgba(15, 23, 42, 0.07);
+  --syn-overlay-strong: rgba(15, 23, 42, 0.10);
+  --syn-overlay-scrim: rgba(15, 23, 42, 0.18);
+}
+
+/* ============================================
+   Global Resets & Base Styles
+   ============================================ */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  font-family: var(--syn-font-sans);
+  font-size: var(--app-font-size);
+  background: var(--syn-bg-base);
+  color: var(--syn-text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ============================================
+   Scrollbar Styling
+   ============================================ */
+
+::-webkit-scrollbar {
+  width: var(--scrollbar-width);
+  height: var(--scrollbar-width);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ============================================
+   Selection
+   ============================================ */
+
+::selection {
+  background: rgba(124, 58, 237, 0.3);
+  color: var(--syn-text-primary);
+}
+
+/* ============================================
+   Glass Panel Utility
+   ============================================ */
+
+.glass-panel {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+}
+
+/* ============================================
+   Background Image System
+   ============================================ */
+
+.app-background {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 0;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  pointer-events: none;
+}
+
+.app-background::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgba(var(--syn-bg-surface-rgb), 0.2);
+}
+
+/* ★ M6 验收 bug4 性能：仅开启壁纸时才挂全屏 backdrop-filter blur。
+   未开壁纸时这层 blur 模糊的只是纯色背景（无视觉收益），却是 GPU 重绘放大器——
+   下层流式 markdown 每帧重绘时强制重新采样全屏模糊，是「30 帧」卡顿的主因之一。门控掉立竿见影。 */
+body[data-wallpaper="enabled"] .app-background::after {
+  backdrop-filter: blur(var(--glass-blur));
+}
+
+/* ============================================
+   Glassmorphism Enhancements
+   ============================================ */
+
+.glass-panel:hover {
+  border-color: var(--glass-border);
+  box-shadow: var(--glass-shadow), inset 0 0 0 1px var(--syn-overlay-weak);
+}
+
+.glass-panel.glass-elevated {
+  background: var(--glass-bg-solid); /* ★ 主题修复：原写死深色 rgba(20,20,30,0.8) → 主题自适应近不透明玻璃底 */
+  backdrop-filter: blur(24px);
+}
+
+/* ============================================
+   Micro-animations
+   ============================================ */
+
+@keyframes fadeSlideUp {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 8px rgba(124, 58, 237, 0.3); }
+  50% { box-shadow: 0 0 16px rgba(124, 58, 237, 0.5); }
+}
+
+.animate-in { animation: fadeSlideUp 200ms ease-out; }
+.pulse-glow { animation: pulseGlow 2s ease-in-out infinite; }
+
+/* ============================================
+   Responsive Layout
+   ============================================ */
+
+@media (max-width: 1200px) {
+  .app-layout { grid-template-columns: 0 1fr 320px !important; }
+}
+
+@media (max-width: 800px) {
+  .app-layout {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: auto 1fr auto !important;
+  }
+  .sidebar { display: none; }
+  .agent-panel { max-height: 50vh; border-left: none; border-top: 1px solid var(--syn-border); }
+}
+
+/* ============================================
+   Bottom Panel Collapse
+   ============================================ */
+
+.bottom-panel { transition: height 200ms ease; overflow: hidden; }
+.bottom-panel.collapsed { height: 0 !important; min-height: 0 !important; padding: 0; border: none; }
+.bottom-panel-handle {
+  height: 4px;
+  cursor: ns-resize;
+  background: transparent;
+  transition: background 200ms;
+}
+.bottom-panel-handle:hover { background: var(--syn-accent); }
+
+/* ============================================
+   Custom Scrollbar
+   ============================================ */
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }

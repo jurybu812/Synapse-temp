@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('node:child_process');
 
 const projectRoot = path.resolve(__dirname, '..');
 const packagePath = path.join(projectRoot, 'package.json');
@@ -116,7 +117,21 @@ for (const entry of uniqueRuntimeEntries) {
   licenseCounts.set(entry.license, (licenseCounts.get(entry.license) || 0) + 1);
 }
 
-const lockSha256 = crypto.createHash('sha256').update(fs.readFileSync(lockPath)).digest('hex');
+const worktreeLockObject = execFileSync('git', ['hash-object', 'package-lock.json'], {
+  cwd: projectRoot,
+  encoding: 'utf8',
+}).trim();
+const committedLockObject = execFileSync('git', ['rev-parse', 'HEAD:package-lock.json'], {
+  cwd: projectRoot,
+  encoding: 'utf8',
+}).trim();
+if (worktreeLockObject !== committedLockObject) {
+  throw new Error('Commit package-lock.json before generating third-party notices');
+}
+const committedLockBytes = execFileSync('git', ['cat-file', 'blob', committedLockObject], {
+  cwd: projectRoot,
+});
+const lockSha256 = crypto.createHash('sha256').update(committedLockBytes).digest('hex');
 const lines = [
   '# Third-Party Notices',
   '',
@@ -124,7 +139,7 @@ const lines = [
   '',
   `- Production packages: ${uniqueRuntimeEntries.length}`,
   `- Direct runtime dependencies: ${directRuntime.size}`,
-  `- Lockfile SHA-256: \`${lockSha256}\``,
+  `- Committed lockfile SHA-256: \`${lockSha256}\``,
   '',
   '## License summary',
   '',

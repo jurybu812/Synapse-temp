@@ -4,7 +4,7 @@ Synapse uses third-party open-source software. Each component remains subject to
 
 - Production packages: 467
 - Direct runtime dependencies: 24
-- Lockfile SHA-256: `32d877bf26ce4b3327491f7a45188e4db097d393e53f44d07dc14971a00c83e8`
+- Committed lockfile SHA-256: `8a2fcda67ca974b351f5dd0da85912614a873de45f4d59f21fdf2a31a6bac18a`
 
 ## License summary
 

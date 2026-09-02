@@ -233,6 +233,29 @@ function collectManifest(root) {
   return files;
 }
 
+function refreshSourceManifest() {
+  const initialGitState = readSourceGitState();
+  if (initialGitState.sourceDirty) {
+    throw new Error('Manifest refresh requires a clean source worktree; commit verified source changes first');
+  }
+  const sourceFiles = collectTrackedSourceFiles();
+  const sourceFileSetSha256 = hashJson(sourceFiles);
+  const manifest = {
+    schemaVersion: 3,
+    generatedAtUtc: new Date().toISOString(),
+    sourceSnapshot: {
+      ...initialGitState,
+      sourceTrackedFileCount: sourceFiles.length,
+      sourceFileSetSha256,
+      targetFileSetSha256: sourceFileSetSha256,
+      exportScriptSha256: sha256(__filename),
+    },
+    files: sourceFiles,
+  };
+  fs.writeFileSync(path.join(sourceRoot, 'SUBMISSION_MANIFEST.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  console.log(`Anonymous submission manifest refreshed: ${manifest.files.length} tracked files`);
+}
+
 function removeIfPresent(targetPath) {
   if (fs.statSync(targetPath, { throwIfNoEntry: false })) fs.rmSync(targetPath, { recursive: true, force: true });
 }
@@ -612,6 +635,7 @@ function printUsage() {
   process.stdout.write([
     'Anonymous repository export:',
     '  node scripts/export-anonymous-submission.cjs --target <empty-git-repository> [--replace]',
+    '  node scripts/export-anonymous-submission.cjs --refresh-manifest',
     '',
     'Final staging export:',
     '  node scripts/export-anonymous-submission.cjs --final-staging <output-directory> --from <anonymous-repository> --readme <README.txt> --video <final-video> [--video <path> ...] [--zip <final.zip>] [--replace]',
@@ -622,6 +646,11 @@ function printUsage() {
 
 if (process.argv.includes('--help') || process.argv.includes('-h')) {
   printUsage();
+  process.exit(0);
+}
+
+if (process.argv.includes('--refresh-manifest')) {
+  refreshSourceManifest();
   process.exit(0);
 }
 

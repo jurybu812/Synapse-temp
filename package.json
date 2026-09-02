@@ -3,7 +3,6 @@
   "private": true,
   "version": "0.1.0",
   "description": "Synapse — 可扩展的桌面编程智能体",
-  "author": "Synapse Contributors",
   "license": "MIT",
   "main": "dist-electron/electron/main.js",
   "scripts": {

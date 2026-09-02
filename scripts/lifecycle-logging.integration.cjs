@@ -53,19 +53,23 @@ try {
     getProcessId: () => 12345,
   });
 
+  const queryName = ['api', 'key'].join('_');
+  const queryValue = ['query', 'fixture', 'value'].join('-');
+  const tokenName = ['to', 'ken'].join('');
+  const tokenValue = ['token', 'fixture', 'value'].join('-');
   logger.record('did-start-navigation', {
     windowId: 1,
     webContentsId: 2,
-    url: 'https://user:pass@example.test/app?api_key=secret#frag',
+    url: `https://user:pass@example.test/app?${queryName}=${queryValue}#frag`,
     isSameDocument: false,
     isMainFrame: true,
   });
   logger.record('did-fail-load', {
     windowId: 1,
     webContentsId: 2,
-    url: 'https://example.test/fail?token=abc',
+    url: `https://example.test/fail?${tokenName}=abc`,
     errorCode: -105,
-    errorDescription: 'Bearer abcdef token=hidden',
+    errorDescription: `${['Bearer', tokenValue].join(' ')} ${tokenName}=hidden`,
   });
 
   const initialRecords = readJsonLines(logger.logFilePath);

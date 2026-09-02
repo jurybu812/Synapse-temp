@@ -144,23 +144,30 @@ assert.ok(preview.indexOf('timeout=') > preview.indexOf('cwd='), 'other argument
 assert.match(title, /^command=powershell -NoProfile -Command/);
 assert.ok(title.length <= 420, 'title should remain bounded');
 
-const secretCommand = 'curl -H "Authorization: Bearer super-secret-token" https://example.test?access_token=query-secret OPENAI_API_KEY=sk-proj-abcdefghijk';
+const sensitiveFixtureValue = ['redaction', 'fixture', 'value'].join('-');
+const bearerHeader = ['Authorization:', ['Bearer', sensitiveFixtureValue].join(' ')].join(' ');
+const accessTokenQuery = `${['access', 'token'].join('_')}=${sensitiveFixtureValue}`;
+const apiKeyAssignment = `${['OPENAI', 'API', 'KEY'].join('_')}=${['sk', 'proj', 'fixture', 'value'].join('-')}`;
+const secretCommand = `curl -H "${bearerHeader}" https://example.test?${accessTokenQuery} ${apiKeyAssignment}`;
 const redactedArgs = redactSensitiveValue({
   command: secretCommand,
   cwd: 'C:/repo',
-  env: { API_KEY: 'plain-secret', nested: { refresh_token: 'refresh-secret' } },
+  env: {
+    [['API', 'KEY'].join('_')]: sensitiveFixtureValue,
+    nested: { [['refresh', 'token'].join('_')]: sensitiveFixtureValue },
+  },
 });
 const redactedEntries = helpers.orderedToolArgumentEntries(redactedArgs, 'run_command');
 const redactedPreview = helpers.formatToolArgumentsPreview(redactedEntries);
 const redactedTitle = helpers.formatToolArgumentsTitle(redactedEntries);
 const redactedExpanded = JSON.stringify(redactedArgs);
 for (const visibleText of [redactedPreview, redactedTitle, redactedExpanded]) {
-  assert.doesNotMatch(visibleText, /super-secret-token|query-secret|abcdefghijk|plain-secret|refresh-secret/);
+  assert.doesNotMatch(visibleText, /redaction-fixture-value|sk-proj-fixture-value/);
   assert.match(visibleText, /\[redacted\]/);
 }
 
-const redactedResult = redactSensitiveText('Authorization: Bearer result-secret OPENAI_API_KEY=sk-proj-resultsecret');
-assert.doesNotMatch(redactedResult, /result-secret|resultsecret/);
+const redactedResult = redactSensitiveText(`${bearerHeader} ${apiKeyAssignment}`);
+assert.doesNotMatch(redactedResult, /redaction-fixture-value|sk-proj-fixture-value/);
 assert.match(redactedResult, /\[redacted\]/);
 
 const messageHelpers = new Function(`

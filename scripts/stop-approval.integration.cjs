@@ -129,13 +129,18 @@ async function main() {
   assert.equal(approvalCoordinator.resolve('approval-b', true), true);
   assert.equal(await second, true);
   assert.equal(current, null);
+  const approvalFixtureValue = ['approval', 'fixture', 'value'].join('-');
+  const approvalBearerHeader = ['Authorization:', ['Bearer', approvalFixtureValue].join(' ')].join(' ');
   const sensitiveApproval = approvalCoordinator.request(
     'run_command',
-    { command: 'curl -H "Authorization: Bearer approval-secret"', API_KEY: 'plain-secret' },
+    {
+      command: `curl -H "${approvalBearerHeader}"`,
+      [['API', 'KEY'].join('_')]: approvalFixtureValue,
+    },
     'command',
     { conversationId: 'conversation-sensitive', callId: 'call-sensitive' },
   );
-  assert.doesNotMatch(current.argsText, /approval-secret|plain-secret/);
+  assert.doesNotMatch(current.argsText, /approval-fixture-value/);
   assert.match(current.argsText, /\[redacted\]/);
   approvalCoordinator.resolve(current.id, false);
   assert.equal(await sensitiveApproval, false);

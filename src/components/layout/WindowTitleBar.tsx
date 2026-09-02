@@ -1,64 +1,73 @@
-import { Brain, Minus, Square, X } from 'lucide-react';
-import { isElectron, platform } from '@/platform';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+import { Brain, Copy, Minus, Square, WifiOff, X } from 'lucide-react';
+import { desktopBridgeState, platform } from '@/platform';
 
 export function WindowTitleBar() {
+  const electronShell = desktopBridgeState !== 'web';
   const [maximized, setMaximized] = useState(false);
 
-  useEffect(() => {
-    if (!isElectron) return;
-    let cancelled = false;
-    void platform.window.isMaximized?.().then(value => {
-      if (!cancelled) setMaximized(value);
-    });
-    return () => {
-      cancelled = true;
-    };
+  const refreshMaximized = useCallback(async () => {
+    try {
+      setMaximized(await platform.window.isMaximized?.() ?? false);
+    } catch {
+      setMaximized(false);
+    }
   }, []);
 
-  if (!isElectron) return null;
+  useEffect(() => {
+    if (!electronShell) return;
+    void refreshMaximized();
+    const handleResize = () => void refreshMaximized();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [electronShell, refreshMaximized]);
 
-  const refreshMaximized = () => {
-    void platform.window.isMaximized?.().then(setMaximized).catch(() => {});
-  };
+  if (!electronShell) return null;
 
   return (
-    <div className="window-titlebar">
+    <div className={`window-titlebar ${desktopBridgeState === 'ready' ? '' : 'bridge-degraded'}`}>
       <div className="window-titlebar-brand">
         <span className="window-titlebar-logo"><Brain size={15} /></span>
         <span className="window-titlebar-name">Synapse</span>
       </div>
+      {desktopBridgeState === 'degraded' && (
+        <div className="window-titlebar-bridge-warning" role="status">
+          <WifiOff size={12} /> 桌面组件版本不一致
+        </div>
+      )}
       <div className="window-titlebar-spacer" />
-      <div className="window-titlebar-controls">
+      <div className="window-titlebar-controls" aria-label="窗口控制">
         <button
-          className="window-control-btn"
           type="button"
-          aria-label="最小化"
+          className="window-control-btn"
           title="最小化"
+          aria-label="最小化窗口"
           onClick={() => platform.window.minimize()}
         >
-          <Minus size={14} />
+          <Minus size={16} aria-hidden="true" />
         </button>
         <button
-          className="window-control-btn"
           type="button"
-          aria-label={maximized ? '还原' : '最大化'}
+          className="window-control-btn"
           title={maximized ? '还原' : '最大化'}
+          aria-label={maximized ? '还原窗口' : '最大化窗口'}
           onClick={() => {
             platform.window.maximize();
-            window.setTimeout(refreshMaximized, 120);
+            window.setTimeout(() => void refreshMaximized(), 120);
           }}
         >
-          <Square size={12} />
+          {maximized
+            ? <Copy size={13} aria-hidden="true" />
+            : <Square size={13} aria-hidden="true" />}
         </button>
         <button
-          className="window-control-btn close"
           type="button"
-          aria-label="关闭"
+          className="window-control-btn window-control-close"
           title="关闭"
+          aria-label="关闭窗口"
           onClick={() => platform.window.close()}
         >
-          <X size={15} />
+          <X size={16} aria-hidden="true" />
         </button>
       </div>
     </div>

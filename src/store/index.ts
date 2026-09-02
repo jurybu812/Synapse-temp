@@ -8,9 +8,9 @@ import { bpcSlice } from './slices/bpc';
 import { settingsSlice } from './slices/settings';
 import { themeSlice } from './slices/theme';
 import { notificationsSlice } from './slices/notifications';
-import { workspaceSlice } from './slices/workspace';
+import { sanitizePersistedWorkspaceState, workspaceSlice } from './slices/workspace';
 import { worktreeSessionSlice } from './slices/worktreeSession';
-import { editorTabsSlice } from './slices/editorTabs';
+import { editorTabsSlice, sanitizePersistedEditorTabsState, serializePersistedEditorTabsState } from './slices/editorTabs';
 import multiAIReducer, { BUILT_IN_MODES } from './slices/multiAI';
 import { normalizeModelOption, providerIdForModel } from '@/services/modelCapabilities';
 import { writeCheckpointActiveConversationId } from '@/services/agentSessionCheckpoint';
@@ -27,6 +27,7 @@ const MULTI_AI_SETTINGS_KEY = 'synapse:multi-ai';
 // ★ 工作区持久化（治「重启后打开的工作区丢失、回退 demo」）：只存 currentPath/name/recentPaths（配置类），
 //   synopsisReady/indexingProgress 是运行态不存。
 const WORKSPACE_KEY = 'synapse_workspace';
+const EDITOR_TABS_KEY = 'synapse_editor_tabs';
 
 const DEFAULT_BACKGROUND_SETTINGS = {
   enabled: false,
@@ -192,6 +193,7 @@ function loadPersistedState() {
     const synopsisRaw = localStorage.getItem(SYNOPSIS_SETTINGS_KEY);
     const multiAIRaw = localStorage.getItem(MULTI_AI_SETTINGS_KEY) ?? localStorage.getItem(MULTI_AI_KEY);
     const workspaceRaw = localStorage.getItem(WORKSPACE_KEY);
+    const editorTabsRaw = localStorage.getItem(EDITOR_TABS_KEY);
     const parsedAgentSettings = agentSettingsRaw ? JSON.parse(agentSettingsRaw) : undefined;
     const backgroundSettings = backgroundRaw ? JSON.parse(backgroundRaw) : undefined;
     const synopsisSettings = synopsisRaw ? JSON.parse(synopsisRaw) : undefined;
@@ -208,12 +210,20 @@ function loadPersistedState() {
       const { apiKeys: _legacyApiKeys, ...safeSettings } = parsedSettings;
       settingsWithoutLegacyApiKeys = safeSettings;
     }
+    let editorTabsSeed: unknown;
+    try {
+      editorTabsSeed = editorTabsRaw ? JSON.parse(editorTabsRaw) : undefined;
+    } catch {
+      editorTabsSeed = undefined;
+    }
+    const workspace = sanitizePersistedWorkspaceState(workspaceRaw ? JSON.parse(workspaceRaw) : undefined) ?? workspaceSlice.getInitialState();
     return {
       settings: settingsWithoutLegacyApiKeys,
       theme: themeRaw ? JSON.parse(themeRaw) : undefined,
       agentSettings: sanitizePersistedAgentSettings(agentSettingsSeed),
       multiAI: sanitizePersistedMultiAI(multiAIRaw ? JSON.parse(multiAIRaw) : undefined),
-      workspace: workspaceRaw ? JSON.parse(workspaceRaw) : undefined,
+      workspace,
+      editorTabs: sanitizePersistedEditorTabsState(editorTabsSeed, workspace.currentPath),
     };
   } catch {
     return {};
@@ -271,12 +281,21 @@ const persistMiddleware: Middleware = (storeApi) => (next) => (action) => {
         //   写入），不是真实打开的文件夹。若把它落盘，重启恢复时 Sidebar 的两个分支都不进（既非真实路径、又非空），
         //   示例文件树永久消失。这里把它视同未打开：currentPath 存 null、name 存空串、recentPaths 过滤掉它。
         const { currentPath, name, recentPaths } = state.workspace;
-        const isDemo = currentPath === '/workspace';
-        localStorage.setItem(WORKSPACE_KEY, JSON.stringify({
-          currentPath: isDemo ? null : currentPath,
-          name: isDemo ? '' : name,
-          recentPaths: Array.isArray(recentPaths) ? recentPaths.filter(p => p !== '/workspace') : recentPaths,
-        }));
+        localStorage.setItem(WORKSPACE_KEY, JSON.stringify(sanitizePersistedWorkspaceState({
+          currentPath,
+          name,
+          recentPaths,
+        })));
+      } catch { /* localStorage 不可用 */ }
+    }
+    if (type.startsWith('editorTabs/') || type.startsWith('workspace/')) {
+      try {
+        const editorTabsSession = serializePersistedEditorTabsState(state.editorTabs, state.workspace.currentPath);
+        if (editorTabsSession) {
+          localStorage.setItem(EDITOR_TABS_KEY, JSON.stringify(editorTabsSession));
+        } else {
+          localStorage.removeItem(EDITOR_TABS_KEY);
+        }
       } catch { /* localStorage 不可用 */ }
     }
     if (type === 'conversationHistory/setSelectedId') {
@@ -341,7 +360,10 @@ export const store = configureStore({
     ...(persisted.agentSettings ? { agentSettings: persisted.agentSettings } : {}),
     ...(persisted.multiAI ? { multiAI: persisted.multiAI } : {}),
     // ★ 工作区持久化恢复：补全运行态默认 + 持久化的 currentPath/name/recentPaths（重启后工作区不丢、工具根延续）。
-    ...(persisted.workspace ? { workspace: { currentPath: null, name: '', recentPaths: [], synopsisReady: false, indexingProgress: 0, ...persisted.workspace } } : {}),
+    workspace: persisted.workspace
+      ? { ...persisted.workspace, synopsisReady: false, indexingProgress: 0 }
+      : workspaceSlice.getInitialState(),
+    editorTabs: persisted.editorTabs ?? editorTabsSlice.getInitialState(),
   },
   // ★ 性能（M7 第四轮）：关闭 dev 专属的 serializableCheck / immutableCheck。
   //   这俩中间件在每个 action 后深度遍历整棵 state 树，而 conversation.messages 是巨大富对象数组

@@ -10,6 +10,7 @@ interface OfficeViewerProps {
 export function OfficeViewer({ filePath, fileName }: OfficeViewerProps) {
   const [data, setData] = useState<ArrayBuffer | null>(null);
   const [convertedPath, setConvertedPath] = useState('');
+  const [cacheHit, setCacheHit] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -22,11 +23,14 @@ export function OfficeViewer({ filePath, fileName }: OfficeViewerProps) {
         setError('');
         setData(null);
         setConvertedPath('');
+        setCacheHit(false);
         const converted = await fileSystem.convertOfficeToPdf(filePath);
         tempDir = converted.tempDir || '';
+        if (cancelled) return;
         const binary = await fileSystem.readBinary(converted.outputPath);
         if (!cancelled) {
           setConvertedPath(converted.outputPath);
+          setCacheHit(converted.cacheHit === true);
           setData(binary);
         }
       } catch (err: any) {
@@ -76,8 +80,8 @@ export function OfficeViewer({ filePath, fileName }: OfficeViewerProps) {
     <div className="office-viewer">
       <div className="viewer-toolbar">
         <span className="viewer-filename">📑 {fileName}</span>
-        <span className="viewer-muted">已转换为 PDF 预览</span>
-        {convertedPath && <span className="viewer-muted" title={convertedPath}>临时预览</span>}
+        <span className="viewer-muted">{cacheHit ? '使用缓存预览' : '已转换为 PDF 预览'}</span>
+        {convertedPath && <span className="viewer-muted" title={convertedPath}>本地预览</span>}
       </div>
       <PdfViewer data={data} currentPage={1} />
     </div>

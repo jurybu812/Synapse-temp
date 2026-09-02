@@ -1,7 +1,23 @@
 import { contextBridge, ipcRenderer } from 'electron';
+import { DESKTOP_BRIDGE_PROTOCOL_VERSION } from '../shared/desktopBridge';
 
 type AgentFileOperation = 'read' | 'write' | 'delete';
 type AgentFileAccessContext = { workspaceRoot: string | null; fullAccess: boolean; approvedPaths: string[]; operations?: AgentFileOperation[]; grantId?: string };
+type SensitiveApprovalLevel = 'auto' | 'read' | 'write' | 'command' | 'dangerous';
+type SensitiveApprovalRequestPayload = {
+  requestId: string;
+  title: string;
+  message: string;
+  details: string[];
+  confirmLabel: string;
+  toolName: string;
+  level: SensitiveApprovalLevel;
+  conversationId?: string;
+  ownerId?: string;
+  runId?: string;
+  callId?: string;
+};
+type SensitiveApprovalCancelPayload = { requestId: string };
 
 contextBridge.exposeInMainWorld('synapse', {
   // 平台信息
@@ -9,6 +25,23 @@ contextBridge.exposeInMainWorld('synapse', {
     info: () => ipcRenderer.invoke('platform:info'),
     openExternal: (url: string) => ipcRenderer.invoke('platform:openExternal', url),
     isElectron: true,
+    bridgeProtocolVersion: DESKTOP_BRIDGE_PROTOCOL_VERSION,
+  },
+
+  approval: {
+    onRequest: (callback: (payload: SensitiveApprovalRequestPayload) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: SensitiveApprovalRequestPayload) => callback(payload);
+      ipcRenderer.on('sensitive-approval:request', listener);
+      return () => ipcRenderer.removeListener('sensitive-approval:request', listener);
+    },
+    onCancel: (callback: (payload: SensitiveApprovalCancelPayload) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: SensitiveApprovalCancelPayload) => callback(payload);
+      ipcRenderer.on('sensitive-approval:cancel', listener);
+      return () => ipcRenderer.removeListener('sensitive-approval:cancel', listener);
+    },
+    respond: (requestId: string, approved: boolean) => {
+      ipcRenderer.send('sensitive-approval:response', { requestId, approved });
+    },
   },
 
   // 窗口操作
@@ -16,6 +49,7 @@ contextBridge.exposeInMainWorld('synapse', {
     minimize: () => ipcRenderer.send('window:minimize'),
     maximize: () => ipcRenderer.send('window:maximize'),
     close: () => ipcRenderer.send('window:close'),
+    reload: () => ipcRenderer.send('window:reload'),
     isMaximized: () => ipcRenderer.invoke('window:isMaximized'),
     onCloseRequested: (callback: (payload: { requestId: string; action: 'close' | 'reload' | 'reloadIgnoringCache' }) => void) => {
       const listener = (_event: Electron.IpcRendererEvent, payload: { requestId: string; action: 'close' | 'reload' | 'reloadIgnoringCache' }) => callback(payload);
@@ -43,7 +77,7 @@ contextBridge.exposeInMainWorld('synapse', {
     search: (dir: string, pattern: string, access?: AgentFileAccessContext) => ipcRenderer.invoke('file:search', dir, pattern, access),
     grep: (dir: string, query: string, opts: any, access?: AgentFileAccessContext) => ipcRenderer.invoke('file:grep', dir, query, opts, access),
     rename: (oldPath: string, newPath: string, access?: AgentFileAccessContext) => ipcRenderer.invoke('file:rename', oldPath, newPath, access),
-    delete: (targetPath: string, access?: AgentFileAccessContext) => ipcRenderer.invoke('file:delete', targetPath, access),
+    delete: (targetPath: string, access?: AgentFileAccessContext, options?: { expectedContent?: string }) => ipcRenderer.invoke('file:delete', targetPath, access, options),
     mkdir: (targetPath: string, access?: AgentFileAccessContext) => ipcRenderer.invoke('file:mkdir', targetPath, access),
     classifyAccess: (filePath: string, workspaceRoot: string | null) => ipcRenderer.invoke('file:classifyAccess', filePath, workspaceRoot),
     showInFolder: (targetPath: string) => ipcRenderer.invoke('file:showInFolder', targetPath),
@@ -59,9 +93,10 @@ contextBridge.exposeInMainWorld('synapse', {
   // 工作区操作
   workspace: {
     open: () => ipcRenderer.invoke('workspace:open'),
+    selectDirectory: () => ipcRenderer.invoke('workspace:selectDirectory'),
     recent: (limit?: number) => ipcRenderer.invoke('workspace:recent', limit),
-    switch: (id: string) => ipcRenderer.invoke('workspace:switch', id),
-    delete: (id: string) => ipcRenderer.invoke('workspace:delete', id),
+    switch: (input: string | { id: string; name: string; path: string }) => ipcRenderer.invoke('workspace:switch', input),
+    delete: (input: string | { id: string; path?: string }) => ipcRenderer.invoke('workspace:delete', input),
     tree: (wsPath: string, maxDepth?: number, access?: AgentFileAccessContext) => ipcRenderer.invoke('workspace:tree', wsPath, maxDepth, access),
   },
 
@@ -170,7 +205,7 @@ contextBridge.exposeInMainWorld('synapse', {
     windsurfStatus: () => ipcRenderer.invoke('provider:windsurfStatus'),
     windsurfLogin: () => ipcRenderer.invoke('provider:windsurfLogin'),
     windsurfComplete: (transactionId: string, token: string) => ipcRenderer.invoke('provider:windsurfComplete', transactionId, token),
-    windsurfImportLocal: (options?: { confirmationToken?: string }) => ipcRenderer.invoke('provider:windsurfImportLocal', options),
+    windsurfImportLocal: (options?: { confirmationToken?: string; candidateFingerprint?: string }) => ipcRenderer.invoke('provider:windsurfImportLocal', options),
     windsurfCancel: () => ipcRenderer.invoke('provider:windsurfCancel'),
     windsurfLogout: () => ipcRenderer.invoke('provider:windsurfLogout'),
     windsurfModels: (force?: boolean) => ipcRenderer.invoke('provider:windsurfModels', force),

@@ -762,6 +762,8 @@ export function registerCommandHandlers(): void {
                 `工作目录：${effectiveCwd}`,
             ],
             confirmLabel: '运行命令',
+            toolName: 'run_command',
+            level: 'command',
             approvalId: `tool-task:${taskId}`,
         });
         if (!approved) throw new Error('用户取消了系统命令');

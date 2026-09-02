@@ -8,6 +8,7 @@ import { useAppDispatch } from '@/store/hooks';
 import { useAppSelector } from '@/store/hooks';
 import { addNotification } from '@/store/slices/notifications';
 import { closeTab } from '@/store/slices/editorTabs';
+import { supersedeDiffsForPaths } from '@/store/slices/conversation';
 import { resolveUnsavedTabs } from '@/services/unsavedChanges';
 import type { RootState } from '@/store';
 import { isElectron } from '@platform/index';
@@ -394,6 +395,10 @@ export function FileTree({ root, onFileClick, onRefresh, onOpenWorkspace, onClea
       }
       await fileSystem.deleteFile(node.path);
       affectedTabs.forEach(tab => dispatch(closeTab(tab.id)));
+      dispatch(supersedeDiffsForPaths({
+        paths: [node.path, ...affectedPaths],
+        includeDescendants: node.type === 'directory',
+      }));
       onRefresh?.();
       notify('success', '删除成功', `"${node.name}" 已删除`);
     } catch (err: any) {

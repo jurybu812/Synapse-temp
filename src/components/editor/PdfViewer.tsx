@@ -7,9 +7,12 @@
  *   根治「连点 +/− 或首帧未完成时缩放 → 同 canvas 重入 pdf.js 抛错被吞、停在旧 scale」。
  * ★ FIX-8：容器 ref + 原生 wheel 监听（passive:false），ctrlKey 时 preventDefault + deltaY 缩放。
  * ★ FIX-9：paged / scroll 两种阅读模式切换；scroll 模式多页竖向堆叠 + IntersectionObserver 同步页码。
- */
+  */
 import { useState, useEffect, useRef, useCallback } from 'react';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url';
+import { useAppDispatch, useAppSelector } from '@/store/hooks';
+import type { RootState } from '@/store';
+import { updatePdfViewState, type PdfViewMode, type PdfViewState } from '@/store/slices/editorTabs';
 
 interface PdfViewerProps {
   data: ArrayBuffer | string; // ArrayBuffer or data URL
@@ -17,11 +20,53 @@ interface PdfViewerProps {
   onPageChange?: (page: number) => void;
 }
 
-type PdfMode = 'paged' | 'scroll';
-
 const ZOOM_MIN = 0.25;
 const ZOOM_MAX = 4;
 const ZOOM_STEP = 0.25;
+
+function isPdfLifecycleCancellation(err: unknown): boolean {
+  const maybeError = err as { name?: string; message?: string } | null | undefined;
+  const name = maybeError?.name ?? '';
+  const message = maybeError?.message ?? '';
+  return name === 'RenderingCancelledException'
+    || name === 'AbortException'
+    || /cancelled|destroyed/i.test(message);
+}
+
+function ignorePdfCleanupRejection(result: unknown, label: string) {
+  if (!result || typeof (result as PromiseLike<unknown>).then !== 'function') return;
+  void Promise.resolve(result).catch(err => {
+    if (!isPdfLifecycleCancellation(err)) {
+      console.warn(`[PdfViewer] ${label} cleanup failed:`, err);
+    }
+  });
+}
+
+function destroyPdfResource(resource: any, label: string) {
+  if (!resource || typeof resource.destroy !== 'function') return;
+  try {
+    ignorePdfCleanupRejection(resource.destroy(), label);
+  } catch (err) {
+    if (!isPdfLifecycleCancellation(err)) {
+      console.warn(`[PdfViewer] ${label} cleanup failed:`, err);
+    }
+  }
+}
+
+function cancelRenderTask(task: any | null) {
+  if (!task || typeof task.cancel !== 'function') return;
+  try { task.cancel(); } catch { /* ignore */ }
+}
+
+type PdfLoadData = { url: string } | { data: Uint8Array };
+
+export function createPdfLoadData(input: ArrayBuffer | string): PdfLoadData {
+  if (typeof input === 'string') return { url: input };
+  const source = new Uint8Array(input);
+  const bytes = new Uint8Array(source.byteLength);
+  bytes.set(source);
+  return { data: bytes };
+}
 
 export function calculatePdfFitScale(containerWidth: number, containerHeight: number, pageWidth: number, pageHeight: number): number {
   if (containerWidth <= 0 || containerHeight <= 0 || pageWidth <= 0 || pageHeight <= 0) return 1;
@@ -32,15 +77,29 @@ export function calculatePdfFitScale(containerWidth: number, containerHeight: nu
 }
 
 export function PdfViewer({ data, currentPage = 1, onPageChange }: PdfViewerProps) {
+  const dispatch = useAppDispatch();
+  const activePdfTabId = useAppSelector((state: RootState) => {
+    const tab = state.editorTabs.tabs.find(item => item.id === state.editorTabs.activeTabId);
+    return tab?.type === 'pdf' ? tab.id : null;
+  });
+  const initialPdfView = useAppSelector((state: RootState) => {
+    const tab = state.editorTabs.tabs.find(item => item.id === state.editorTabs.activeTabId);
+    return tab?.type === 'pdf' ? tab.pdfViewState : undefined;
+  });
+  const initialPage = initialPdfView?.page ?? currentPage;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [totalPages, setTotalPages] = useState(0);
-  const [page, setPage] = useState(currentPage);
-  const [scale, setScale] = useState(1);
-  const [mode, setMode] = useState<PdfMode>('paged');
+  const [page, setPage] = useState(initialPage);
+  const [scale, setScale] = useState(initialPdfView?.scale ?? 1);
+  const [mode, setMode] = useState<PdfViewMode>(initialPdfView?.mode ?? 'paged');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const pdfRef = useRef<any>(null);
+  const loadingTaskRef = useRef<any>(null);
+  const loadTokenRef = useRef(0);
   const userAdjustedScaleRef = useRef(false);
+  const restoredPdfViewRef = useRef<PdfViewState | undefined>(initialPdfView);
+  restoredPdfViewRef.current = initialPdfView;
 
   // ★ FIX-10：仅记录「最新在飞的 RenderTask」，供 finally 安全回收（=== myTask 才置空）；
   //   取消职责已下放到每个 run 的闭包 myTask（见 paged effect），不再由这个共享 ref 承担。
@@ -66,7 +125,7 @@ export function PdfViewer({ data, currentPage = 1, onPageChange }: PdfViewerProp
   // ★ FIX-9：scroll 模式下「点翻页按钮要把目标页滚入视图」。用 {page,nonce} 触发，
   //   nonce 每次点击自增以区分「同页重复点」，避免与 IntersectionObserver 回写形成死循环
   //   （observer 只 setPage，不动 scrollRequest）。
-  const [scrollRequest, setScrollRequest] = useState<{ page: number; nonce: number }>({ page: currentPage, nonce: 0 });
+  const [scrollRequest, setScrollRequest] = useState<{ page: number; nonce: number }>({ page: initialPage, nonce: 0 });
 
   const zoomIn = useCallback(() => {
     userAdjustedScaleRef.current = true;
@@ -77,41 +136,91 @@ export function PdfViewer({ data, currentPage = 1, onPageChange }: PdfViewerProp
     setScale(s => Math.max(s - ZOOM_STEP, ZOOM_MIN));
   }, []);
 
+  useEffect(() => {
+    const restoredView = restoredPdfViewRef.current;
+    const nextPage = restoredView?.page ?? currentPage;
+    setPage(nextPage);
+    setScale(restoredView?.scale ?? 1);
+    setMode(restoredView?.mode ?? 'paged');
+    userAdjustedScaleRef.current = restoredView?.scale !== undefined;
+    setScrollRequest(prev => ({ page: nextPage, nonce: prev.nonce + 1 }));
+  }, [activePdfTabId, currentPage, data]);
+
+  useEffect(() => {
+    if (!activePdfTabId || totalPages <= 0) return;
+    dispatch(updatePdfViewState({ id: activePdfTabId, page, scale, mode }));
+  }, [activePdfTabId, dispatch, mode, page, scale, totalPages]);
+
   // ── 加载 PDF 文档（data 变化时重载）。
   useEffect(() => {
+    const token = ++loadTokenRef.current;
     let cancelled = false;
+    let loadingTask: any = null;
+    let loadedPdf: any = null;
+
+    renderTokenRef.current += 1;
+    cancelRenderTask(renderTaskRef.current);
+    renderTaskRef.current = null;
+    pdfRef.current = null;
+    loadingTaskRef.current = null;
+    setTotalPages(0);
+
     (async () => {
       try {
         setError('');
         setLoading(true);
-        userAdjustedScaleRef.current = false;
-        setScale(1);
-        const pdfjsLib = await import('pdfjs-dist');
-        pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+        const restoredView = restoredPdfViewRef.current;
+        const restoredPage = restoredView?.page ?? currentPage;
+        userAdjustedScaleRef.current = restoredView?.scale !== undefined;
+        setPage(restoredPage);
+        setScale(restoredView?.scale ?? 1);
+        setMode(restoredView?.mode ?? 'paged');
+        setScrollRequest(prev => ({ page: restoredPage, nonce: prev.nonce + 1 }));
         if (typeof data === 'string' && data.startsWith('/workspace/')) {
           throw new Error('Web 模式下请先导入真实 PDF 文件');
         }
-        const loadData = typeof data === 'string'
-          ? { url: data }
-          : { data: data.slice(0) };
-        const pdf = await pdfjsLib.getDocument(loadData).promise;
-        if (cancelled) return;
+        const pdfjsLib = await import('pdfjs-dist');
+        if (cancelled || token !== loadTokenRef.current) return;
+        pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+        const loadData = createPdfLoadData(data);
+        loadingTask = pdfjsLib.getDocument(loadData);
+        loadingTaskRef.current = loadingTask;
+        const pdf = await loadingTask.promise;
+        loadedPdf = pdf;
+        if (loadingTaskRef.current === loadingTask) loadingTaskRef.current = null;
+        if (cancelled || token !== loadTokenRef.current) {
+          destroyPdfResource(pdf, 'late PDF document');
+          return;
+        }
         pdfRef.current = pdf;
         setTotalPages(pdf.numPages);
+        const clampedPage = Math.max(1, Math.min(restoredPdfViewRef.current?.page ?? currentPage, pdf.numPages));
+        setPage(clampedPage);
+        setScrollRequest(prev => ({ page: clampedPage, nonce: prev.nonce + 1 }));
         setLoading(false);
       } catch (err) {
+        if (loadingTaskRef.current === loadingTask) loadingTaskRef.current = null;
+        if (cancelled || token !== loadTokenRef.current || isPdfLifecycleCancellation(err)) return;
         console.error('[PdfViewer] Load error:', err);
-        if (!cancelled) {
-          const detail = err instanceof Error ? err.message : '';
-          setError(detail.startsWith('Web 模式下')
-            ? detail
-            : 'PDF 无法打开，文件可能已损坏或格式不受支持');
-          setLoading(false);
-        }
+        const detail = err instanceof Error ? err.message : '';
+        setError(detail.startsWith('Web 模式下')
+          ? detail
+          : 'PDF 无法打开，文件可能已损坏或格式不受支持');
+        setLoading(false);
       }
     })();
-    return () => { cancelled = true; };
-  }, [data]);
+    return () => {
+      cancelled = true;
+      if (loadTokenRef.current === token) loadTokenRef.current += 1;
+      if (loadingTaskRef.current === loadingTask) loadingTaskRef.current = null;
+      if (loadedPdf) {
+        if (pdfRef.current === loadedPdf) pdfRef.current = null;
+        destroyPdfResource(loadedPdf, 'PDF document');
+      } else {
+        destroyPdfResource(loadingTask, 'PDF loading task');
+      }
+    };
+  }, [data, currentPage]);
 
   useEffect(() => {
     if (!containerEl || totalPages <= 0 || !pdfRef.current || userAdjustedScaleRef.current) return;
@@ -171,7 +280,8 @@ export function PdfViewer({ data, currentPage = 1, onPageChange }: PdfViewerProp
   //   防重入抛错的好处保留：旧帧 token 失配会主动 cancel，同一 canvas 任意时刻只有最新 task 在画。
   useEffect(() => {
     if (mode !== 'paged') return;
-    if (!pdfRef.current || !canvasRef.current) return;
+    const pdfDocument = pdfRef.current;
+    if (!pdfDocument || !canvasRef.current) return;
 
     const token = ++renderTokenRef.current;
     let myTask: any = null;
@@ -179,7 +289,7 @@ export function PdfViewer({ data, currentPage = 1, onPageChange }: PdfViewerProp
 
     (async () => {
       try {
-        const pdfPage = await pdfRef.current.getPage(page);
+        const pdfPage = await pdfDocument.getPage(page);
         if (cancelled || token !== renderTokenRef.current) return; // 本帧已被取代/作废，丢弃。
         const viewport = pdfPage.getViewport({ scale });
         const canvas = canvasRef.current;
@@ -206,8 +316,7 @@ export function PdfViewer({ data, currentPage = 1, onPageChange }: PdfViewerProp
         await myTask.promise;
       } catch (err: any) {
         // 被 cleanup 取消时 pdf.js 抛 RenderingCancelledException；本帧已作废，静默忽略。
-        const name = err?.name || '';
-        if (cancelled || name === 'RenderingCancelledException' || /cancelled/i.test(err?.message || '')) {
+        if (cancelled || isPdfLifecycleCancellation(err)) {
           return;
         }
         if (token === renderTokenRef.current) {
@@ -223,9 +332,7 @@ export function PdfViewer({ data, currentPage = 1, onPageChange }: PdfViewerProp
     return () => {
       // effect 重跑/卸载：标记本帧作废 + 取消「本 run 自己创建的」task（绝不碰别的 run 的 task）。
       cancelled = true;
-      if (myTask) {
-        try { myTask.cancel(); } catch { /* ignore */ }
-      }
+      cancelRenderTask(myTask);
     };
   }, [mode, page, totalPages, scale]);
 
@@ -398,6 +505,17 @@ function PdfScrollView({ pdf, totalPages, scale, activePage, scrollRequest, cont
   //   渲染失败/被取消时不写入（保持 undefined），下次进入视口会重试。
   const renderedScaleRefs = useRef<number[]>([]);
 
+  useEffect(() => {
+    return () => {
+      tokenRefs.current = tokenRefs.current.map(token => (token ?? 0) + 1);
+      for (const task of taskRefs.current) {
+        cancelRenderTask(task);
+      }
+      taskRefs.current = [];
+      renderedScaleRefs.current = [];
+    };
+  }, [pdf]);
+
   // 渲染单页（按需）。
   const renderPage = useCallback(async (pageNum: number) => {
     if (!pdf) return;
@@ -409,6 +527,8 @@ function PdfScrollView({ pdf, totalPages, scale, activePage, scrollRequest, cont
     if (renderedScaleRefs.current[idx] === scale && canvas.width > 0) return;
     const token = (tokenRefs.current[idx] ?? 0) + 1;
     tokenRefs.current[idx] = token;
+    cancelRenderTask(taskRefs.current[idx]);
+    taskRefs.current[idx] = null;
     let localTask: any = null;
     try {
       const pdfPage = await pdf.getPage(pageNum);
@@ -424,9 +544,6 @@ function PdfScrollView({ pdf, totalPages, scale, activePage, scrollRequest, cont
       canvas.style.height = `${viewport.height}px`;
       const renderViewport = dpr === 1 ? viewport : pdfPage.getViewport({ scale: scale * dpr });
       // 重渲前取消本页可能仍在飞的旧 task（如 scale 连变），同 canvas 只留最新 task 在画。
-      if (taskRefs.current[idx]) {
-        try { taskRefs.current[idx].cancel(); } catch { /* ignore */ }
-      }
       // 设置新 width 会清空 canvas 内容；重渲未落地前先标记「此 scale 尚未渲染完成」，
       // 防止渲染中途被并发短路误判为已完成。
       renderedScaleRefs.current[idx] = -1;
@@ -436,8 +553,7 @@ function PdfScrollView({ pdf, totalPages, scale, activePage, scrollRequest, cont
       // ★ 渲染成功落地：记录本页已按此 scale 渲染过，供后续重复进出视口时短路。
       if (token === tokenRefs.current[idx]) renderedScaleRefs.current[idx] = scale;
     } catch (err: any) {
-      const name = err?.name || '';
-      if (name === 'RenderingCancelledException' || /cancelled/i.test(err?.message || '')) return;
+      if (isPdfLifecycleCancellation(err)) return;
       if (token === tokenRefs.current[idx]) {
         console.error('[PdfViewer] Scroll render error:', err);
         onError(err instanceof Error ? err.message : 'PDF 渲染失败');

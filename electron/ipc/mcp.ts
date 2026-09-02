@@ -10,7 +10,83 @@ import * as fs from 'fs';
 import { confirmSensitiveOperationInMainWindow } from './file';
 
 const servers = new Map<string, MCPServerProcess>();
+const lifecycleOperations = new Map<string, Promise<unknown>>();
+const lifecycleGenerations = new Map<string, number>();
 let externalMcpDisabled = false;
+
+function removeServerIfCurrent(name: string, proc: MCPServerProcess): void {
+    if (servers.get(name) === proc) servers.delete(name);
+}
+
+function advanceLifecycleGeneration(name: string): number {
+    const generation = (lifecycleGenerations.get(name) ?? 0) + 1;
+    lifecycleGenerations.set(name, generation);
+    return generation;
+}
+
+function assertLifecycleGeneration(name: string, generation: number): void {
+    if (lifecycleGenerations.get(name) !== generation) {
+        throw new Error(`MCP lifecycle superseded: ${name}`);
+    }
+}
+
+async function withServerLifecycle<T>(name: string, operation: () => Promise<T>): Promise<T> {
+    const previous = lifecycleOperations.get(name) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    lifecycleOperations.set(name, current);
+    try {
+        return await current;
+    } finally {
+        if (lifecycleOperations.get(name) === current) lifecycleOperations.delete(name);
+    }
+}
+
+interface MCPServerStatusView {
+    name: string;
+    status: string;
+    running: boolean;
+    configured: boolean;
+    enabled: boolean;
+    tools: string[];
+    toolDefinitions: unknown[];
+}
+
+async function readServerStatus(
+    name: string,
+    configured: boolean,
+    enabled: boolean,
+    fallbackStatus: string,
+): Promise<MCPServerStatusView> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        const proc = servers.get(name);
+        const running = proc?.status === 'running';
+        const listedTools = running ? await proc.listTools() : [];
+        if (servers.get(name) !== proc || proc?.status !== 'running') {
+            if (attempt === 0) continue;
+            const current = servers.get(name);
+            return {
+                name,
+                status: current?.status ?? fallbackStatus,
+                running: false,
+                configured,
+                enabled,
+                tools: [],
+                toolDefinitions: [],
+            };
+        }
+        const toolDefinitions = [...new Map(listedTools.map(tool => [tool.name, tool])).values()];
+        return {
+            name,
+            status: proc.status,
+            running: true,
+            configured,
+            enabled,
+            tools: toolDefinitions.map(tool => tool.name),
+            toolDefinitions,
+        };
+    }
+    return { name, status: fallbackStatus, running: false, configured, enabled, tools: [], toolDefinitions: [] };
+}
 
 function assertExternalMCPEnabled(): void {
     if (externalMcpDisabled) throw new MCPServerUnavailableError('External MCP is disabled for this runtime');
@@ -43,6 +119,7 @@ interface MCPConfigEntry {
     //   也兼容「只给 url 不给 command」的隐式 http 判定（见 MCPServerProcess 构造函数）。
     transport?: 'stdio' | 'http';
     url?: string;
+    initializeTimeoutMs?: number;
 }
 
 /**
@@ -55,7 +132,12 @@ function createServerProcess(name: string, entry: MCPConfigEntry): MCPServerProc
         entry.command ?? '',
         entry.args,
         entry.env,
-        { transport: entry.transport, url: entry.url },
+        {
+            transport: entry.transport,
+            url: entry.url,
+            initializeTimeoutMs: entry.initializeTimeoutMs
+                ?? (name === 'web-fetcher' || name === 'memory-store' ? 60_000 : undefined),
+        },
     );
 }
 
@@ -122,10 +204,12 @@ export async function startEnabledMCPServers(): Promise<void> {
         tasks.push(
             proc.start()
                 .then(() => { console.log(`[MCP] auto-started "${name}"`); })
-                .catch(err => {
+                .catch(async err => {
                     console.error(`[MCP] auto-start "${name}" failed:`, (err as Error)?.message);
-                    // 启动失败的从 map 移除，避免后续 status 误报为存在但实际未运行。
-                    servers.delete(name);
+                    await proc.stop().catch(stopError => {
+                        console.warn(`[MCP] auto-start cleanup "${name}" failed:`, (stopError as Error)?.message);
+                    });
+                    removeServerIfCurrent(name, proc);
                 }),
         );
     }
@@ -195,32 +279,18 @@ export function registerMCPHandlers(options: { disabled?: boolean } = {}): void 
     ipcMain.handle('mcp:status', async () => {
         if (externalMcpDisabled) return { servers: [], disabled: true };
         const config = loadMCPConfig();
-        const result: Array<{ name: string; status: string; running: boolean; configured: boolean; enabled: boolean; tools: string[]; toolDefinitions: unknown[] }> = [];
-        for (const [name, entry] of Object.entries(config)) {
-            const proc = servers.get(name);
-            const running = proc?.status === 'running';
-            const listedTools = running ? await proc!.listTools() : [];
-            const toolDefinitions = [...new Map(listedTools.map(tool => [tool.name, tool])).values()];
-            const tools = toolDefinitions.map(t => t.name);
-            result.push({
+        const configuredServers = await Promise.all(Object.entries(config).map(([name, entry]) => (
+            readServerStatus(
                 name,
-                status: proc?.status ?? (entry.enabled === false ? 'disabled' : 'stopped'),
-                running,
-                configured: true,
-                enabled: entry.enabled !== false,
-                tools,
-                toolDefinitions,
-            });
-        }
-        for (const [name, proc] of servers) {
-            if (config[name]) continue;
-            const running = proc.status === 'running';
-            const listedTools = running ? await proc.listTools() : [];
-            const toolDefinitions = [...new Map(listedTools.map(tool => [tool.name, tool])).values()];
-            const tools = toolDefinitions.map(t => t.name);
-            result.push({ name, status: proc.status, running, configured: false, enabled: true, tools, toolDefinitions });
-        }
-        return { servers: result };
+                true,
+                entry.enabled !== false,
+                entry.enabled === false ? 'disabled' : 'stopped',
+            )
+        )));
+        const unconfiguredServers = await Promise.all([...servers.entries()]
+            .filter(([name]) => !config[name])
+            .map(([name]) => readServerStatus(name, false, true, 'stopped')));
+        return { servers: [...configuredServers, ...unconfiguredServers] };
     });
 
     // 启动 MCP 服务器
@@ -231,23 +301,58 @@ export function registerMCPHandlers(options: { disabled?: boolean } = {}): void 
         const entry = config[name];
         if (!entry) throw new Error(`MCP server "${name}" not found in config`);
 
+        const existing = servers.get(name);
+        if (existing?.status === 'running') {
+            return { status: 'running', reused: true };
+        }
+        if (existing?.status === 'starting') {
+            await existing.start();
+            return { status: existing.status, reused: true };
+        }
+
+        const generation = advanceLifecycleGeneration(name);
         await confirmMCPLifecycleChange(event.sender, 'start', name);
-        const proc = createServerProcess(name, entry);
-        bindStatusBroadcast(proc);
-        servers.set(name, proc);
-        await proc.start();
-        return { status: 'running' };
+        assertLifecycleGeneration(name, generation);
+        return withServerLifecycle(name, async () => {
+            assertLifecycleGeneration(name, generation);
+            const current = servers.get(name);
+            if (current?.status === 'running' || current?.status === 'starting') {
+                return { status: current.status, reused: true };
+            }
+            if (current) {
+                await current.stop();
+                removeServerIfCurrent(name, current);
+            }
+            assertLifecycleGeneration(name, generation);
+            const proc = createServerProcess(name, entry);
+            bindStatusBroadcast(proc);
+            servers.set(name, proc);
+            try {
+                await proc.start();
+                assertLifecycleGeneration(name, generation);
+                return { status: 'running', reused: false };
+            } catch (error) {
+                await proc.stop().catch(() => undefined);
+                removeServerIfCurrent(name, proc);
+                throw error;
+            }
+        });
     });
 
     // 停止 MCP
     ipcMain.handle('mcp:stop', async (event, rawName: unknown) => {
         if (externalMcpDisabled) return { status: 'disabled' };
         const name = normalizeMCPIdentifier(rawName, 'MCP server');
+        if (!servers.has(name)) {
+            advanceLifecycleGeneration(name);
+            return { status: 'stopped' };
+        }
+        await confirmMCPLifecycleChange(event.sender, 'stop', name);
+        advanceLifecycleGeneration(name);
         const proc = servers.get(name);
         if (proc) {
-            await confirmMCPLifecycleChange(event.sender, 'stop', name);
             await proc.stop();
-            servers.delete(name);
+            removeServerIfCurrent(name, proc);
         }
         return { status: 'stopped' };
     });
@@ -261,16 +366,28 @@ export function registerMCPHandlers(options: { disabled?: boolean } = {}): void 
         if (!entry) throw new Error(`MCP server "${name}" not found`);
 
         await confirmMCPLifecycleChange(event.sender, 'restart', name);
-        const proc = servers.get(name);
-        if (proc) {
-            await proc.stop();
-            servers.delete(name);
-        }
-        const newProc = createServerProcess(name, entry);
-        bindStatusBroadcast(newProc);
-        servers.set(name, newProc);
-        await newProc.start();
-        return { status: 'running' };
+        const generation = advanceLifecycleGeneration(name);
+        return withServerLifecycle(name, async () => {
+            assertLifecycleGeneration(name, generation);
+            const proc = servers.get(name);
+            if (proc) {
+                await proc.stop();
+                removeServerIfCurrent(name, proc);
+            }
+            assertLifecycleGeneration(name, generation);
+            const newProc = createServerProcess(name, entry);
+            bindStatusBroadcast(newProc);
+            servers.set(name, newProc);
+            try {
+                await newProc.start();
+                assertLifecycleGeneration(name, generation);
+                return { status: 'running' };
+            } catch (error) {
+                await newProc.stop().catch(() => undefined);
+                removeServerIfCurrent(name, newProc);
+                throw error;
+            }
+        });
     });
 
     // 列出工具

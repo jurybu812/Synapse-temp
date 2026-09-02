@@ -17,7 +17,7 @@ export function isExactTokenModel(model: string | undefined): boolean {
 /** 字符估算回退（中文 1.5 / 其它 0.25，与 systemPrompt.estimateTokens 同口径；复制一份避免循环依赖）。 */
 function estimateFallback(text: string): number {
   if (!text) return 0;
-  const chinese = (text.match(/[一-鿿　-〿＀-￯]/g) || []).length;
+  const chinese = (text.match(/[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/g) || []).length;
   return Math.ceil(chinese * 1.5 + (text.length - chinese) * 0.25);
 }
 

@@ -21,8 +21,13 @@ import { setSafety } from '@/store/slices/settings';
 // ★ M4-6-S2：@设置选中后跳转——切到设置分区（sidebar）+ 展开侧栏（layout）。
 import { setActiveView } from '@/store/slices/sidebar';
 import { MessageBubble } from '@/components/chat/MessageBubble';
-import { nextTailPinnedState, useMessageWindow } from '@/components/chat/useMessageWindow';
-import { ApprovalDialog, type ApprovalRequest } from '@/components/ui/ApprovalDialog';
+import {
+  isIndexInTaskBoundaryBodyRange,
+  nextTailPinnedState,
+  resolveTaskBoundaryBodyRange,
+  useMessageWindow,
+  type TaskBoundaryBodyRange,
+} from '@/components/chat/useMessageWindow';
 import { approvalCoordinator } from '@/services/approvalCoordinator';
 import { TaskBoundaryCard, type BoundaryFile } from '@/components/chat/TaskBoundaryCard';
 import { resolveEditorType } from '@/services/editorFileTypes';
@@ -38,7 +43,7 @@ import { toolRegistry } from '@/services/toolRegistry';
 // ★ M4-7-S4：构建 AgentLoop 时把 MCP server 工具桥接进 toolRegistry（MCP 工具进工具循环）。
 import { mcpBridge } from '@/services/mcpBridge';
 import { addNotification } from '@/store/slices/notifications';
-import { addMessage, clearConversation, clearMessages, editMessage, truncateAt, deleteMessage, endTaskBoundary, enqueueMessage, dequeueMessage, clearQueue, enqueueInterrupt, dequeueInterrupt, clearInterruptQueue, moveQueueItem, reconcileToolTaskStatus, settleRecoveredToolTaskBoundaries, setConversation, setActiveConversation, setConversationWorkspace, setGoal, setModel as setConversationModel, setPendingMessage, setProjectedTokenCount, setStreaming, setTokenUsage, updateDiffStatus, setDiffReviewError, updateMessage, updateMessageMeta, selectActiveConversation, selectConversationById, type AttachmentRef, type MessageContentPart, type QueuedMessage, type FileDiffSummary, type ToolCall } from '@/store/slices/conversation';
+import { addMessage, clearConversation, clearMessages, editMessage, truncateAt, deleteMessage, endTaskBoundary, enqueueMessage, dequeueMessage, clearQueue, enqueueInterrupt, dequeueInterrupt, clearInterruptQueue, moveQueueItem, reconcileToolTaskStatus, settleRecoveredToolTaskBoundaries, setConversation, setActiveConversation, setConversationWorkspace, setGoal, setModel as setConversationModel, setPendingMessage, setProjectedTokenCount, setStreaming, setTokenUsage, updateDiffStatus, setDiffReviewError, updateMessage, updateMessageMeta, selectActiveConversation, selectConversationById, type AttachmentRef, type MessageContentPart, type QueuedMessage, type FileDiffSummary, type ToolCall, type TokenUsage } from '@/store/slices/conversation';
 // ★ M3-2b：@MultiAI:模式名 触发固定工作流（解析 + 跑 runWorkflow + 汇总文本），见 services/multiAITrigger.ts。
 // ★ M3-3a：generateWorkflowRunId 预生成稳定 runId，跑前先建占位 assistant 消息 + 关联卡片实时显示。
 import { parseMultiAITrigger, runMultiAITrigger, generateWorkflowRunId } from '@/services/multiAITrigger';
@@ -47,7 +52,7 @@ import { agentOrchestrator } from '@/services/agentOrchestrator';
 import { exitWorktree, renameWorktreeContext } from '@/store/slices/worktreeSession';
 import { migrateTrackedChanges } from '@/services/fileChangeTracker';
 import { countConversationTokensExact } from '@/services/tokenizer';
-import { estimateTokens, renderOpenFilesSection, renderRuntimeContextSection } from '@/services/systemPrompt';
+import { estimateTokens, promptBuilder, renderOpenFilesSection, renderRuntimeContextSection } from '@/services/systemPrompt';
 import { getModelContextWindowForOption } from '@/store/selectors/modelSelectors';
 import { conversationExporter } from '@/services/conversationExporter';
 import { clearAutosaveSnapshot, loadAutosaveSnapshot, saveAutosaveSnapshot, saveConversationSnapshot, loadConversationSnapshot, migrateSnapshotAttachments, branchConversation, beginConversationSwitch, endConversationSwitch, isConversationSwitchCurrent, listConversationSummaries, AUTOSAVE_ID, CONVERSATION_SCHEMA_VERSION } from '@/services/conversationPersistence';
@@ -76,9 +81,11 @@ import {
   buildQueueDrainBatch,
   hasPendingToolTaskWork,
   isQueueDrainBatchCurrent,
+  interruptContinuationFromBoundary,
   queueDrainBlockReason,
   queueDrainBoundaryMode,
   queueDrainCoordinator,
+  type InterruptContinuationTaskBoundary,
   type QueueDrainResult,
 } from '@/services/queueDrainCoordinator';
 // ★ Plan_5 梯队二 M5-3/4/5：回溯 / 重试 / 分支共用「按轮截断 + record 砍批到轮边界」helper（复用 roundBoundary）。
@@ -97,6 +104,9 @@ import {
   readCheckpointAgentTab,
   readCheckpointChatScroll,
   readCheckpointTabScroll,
+  clampChatScrollAnchorOffset,
+  clampChatScrollTopForRestore,
+  isChatScrollAnchorOffsetWithinViewportBand,
   writeAgentSessionViewport,
   type AgentPanelTab,
   type ChatScrollCheckpoint,
@@ -112,6 +122,48 @@ const NON_FILE_EDITOR_TAB_TYPES = new Set([
   'welcome', 'settings', 'workflow', 'review', 'showcase', 'unsupported', 'attachment',
 ]);
 const PROJECTED_OPEN_FILES_LIMIT = 20;
+function isLiveAssistantRunStatus(status: unknown): boolean {
+  return status === 'idle' || status === 'pending' || status === 'streaming';
+}
+
+function hasLiveAssistantRun(runs: Record<string, { status?: unknown }> | undefined): boolean {
+  return Object.values(runs ?? {}).some(run => isLiveAssistantRunStatus(run.status));
+}
+
+type TokenUsageGenerationFields = Partial<Pick<TokenUsage,
+  'conversationId'
+  | 'providerId'
+  | 'modelId'
+  | 'accountFingerprint'
+  | 'credentialGeneration'
+  | 'catalogGeneration'
+  | 'compressionGeneration'
+  | 'runId'
+>>;
+
+function tokenUsageMatchesCurrentGeneration(
+  usage: TokenUsageGenerationFields | null | undefined,
+  expected: {
+    conversationId: string;
+    providerId: string;
+    modelId: string;
+    accountFingerprint?: string | null;
+    credentialGeneration?: number;
+    catalogGeneration?: string;
+    compressionGeneration: string;
+    liveRunIds?: ReadonlySet<string>;
+  },
+): usage is TokenUsage {
+  if (!usage) return false;
+  if (usage.conversationId !== expected.conversationId) return false;
+  if (usage.providerId !== expected.providerId || usage.modelId !== expected.modelId) return false;
+  if ((usage.accountFingerprint ?? null) !== (expected.accountFingerprint ?? null)) return false;
+  if ((usage.credentialGeneration ?? 0) !== (expected.credentialGeneration ?? 0)) return false;
+  if (expected.catalogGeneration && usage.catalogGeneration !== expected.catalogGeneration) return false;
+  if (String(usage.compressionGeneration ?? '0') !== expected.compressionGeneration) return false;
+  if (expected.liveRunIds && (!usage.runId || !expected.liveRunIds.has(usage.runId))) return false;
+  return true;
+}
 /** 按开关过滤掉系统/元工具调用；全被过滤则返回 undefined（不渲染空的工具调用容器）。 */
 function filterSystemToolCalls<T extends { name?: string }>(tcs: T[] | undefined, hide: boolean): T[] | undefined {
   if (!hide || !tcs || tcs.length === 0) return tcs;
@@ -164,8 +216,126 @@ type MessageRenderUnit = {
   id: string;
   startIdx: number;
   endIdx: number;
-  boundary?: any;
+  boundaryId?: string;
+  boundaryItemCount?: number;
 };
+
+type TaskBoundaryRenderRange = TaskBoundaryBodyRange & {
+  boundaryId: string;
+  itemCount: number;
+};
+
+type ChatScrollAnchorCandidate = {
+  element: HTMLElement;
+  rect: DOMRect;
+  offsetTop: number;
+  topInsideViewport: boolean;
+  rank: number;
+};
+
+function chatScrollAnchorRank(element: HTMLElement): number {
+  if (element.dataset.messageId) return 0;
+  if (element.dataset.taskStepId) return 1;
+  if (element.dataset.taskBoundaryId) return 2;
+  return 3;
+}
+
+function selectChatScrollCheckpointAnchorElement(container: HTMLElement, containerRect: DOMRect): HTMLElement | undefined {
+  const viewportTop = containerRect.top + 1;
+  const viewportBottom = containerRect.bottom - 1;
+  const candidates = [...container.querySelectorAll<HTMLElement>('[data-message-id], [data-task-step-id], [data-task-boundary-id]')]
+    .map((element): ChatScrollAnchorCandidate => {
+      const rect = element.getBoundingClientRect();
+      return {
+        element,
+        rect,
+        offsetTop: rect.top - containerRect.top,
+        topInsideViewport: rect.top >= viewportTop && rect.top < viewportBottom,
+        rank: chatScrollAnchorRank(element),
+      };
+    })
+    .filter(candidate => candidate.rect.bottom > viewportTop && candidate.rect.top < viewportBottom);
+  const topInsideCandidates = candidates.filter(candidate => candidate.topInsideViewport);
+  const selected = (topInsideCandidates.length > 0 ? topInsideCandidates : candidates)
+    .sort((left, right) => {
+      const distanceDelta = Math.abs(left.offsetTop) - Math.abs(right.offsetTop);
+      if (Math.abs(distanceDelta) > 0.5) return distanceDelta;
+      return left.rank - right.rank;
+    })[0];
+  if (!selected) return undefined;
+  if (!selected.topInsideViewport && !isChatScrollAnchorOffsetWithinViewportBand(selected.offsetTop, container.clientHeight)) return undefined;
+  return selected.element;
+}
+
+function isBoundaryBodyMessage(message: any, hideSystemTools: boolean): boolean {
+  return message?.role !== 'tool' && !isEmptyAssistantMessage(message, hideSystemTools);
+}
+
+function countBoundaryBodyItems(messages: any[], range: TaskBoundaryBodyRange, hideSystemTools: boolean): number {
+  let count = 0;
+  for (let index = range.startIdx; index <= range.endIdx && index < messages.length; index += 1) {
+    if (isBoundaryBodyMessage(messages[index], hideSystemTools)) count += 1;
+  }
+  return count;
+}
+
+function boundaryBodyItemAt(
+  messages: any[],
+  range: TaskBoundaryBodyRange,
+  itemCount: number,
+  hideSystemTools: boolean,
+  itemIndex: number,
+): any | undefined {
+  const target = Number.isFinite(itemIndex) ? Math.floor(itemIndex) : -1;
+  if (target < 0 || target >= itemCount) return undefined;
+  const reverseTarget = itemCount - 1 - target;
+  if (target <= reverseTarget) {
+    let seen = 0;
+    for (let index = range.startIdx; index <= range.endIdx && index < messages.length; index += 1) {
+      const message = messages[index];
+      if (!isBoundaryBodyMessage(message, hideSystemTools)) continue;
+      if (seen === target) return message;
+      seen += 1;
+    }
+    return undefined;
+  }
+  let seenFromEnd = 0;
+  for (let index = Math.min(range.endIdx, messages.length - 1); index >= range.startIdx; index -= 1) {
+    const message = messages[index];
+    if (!isBoundaryBodyMessage(message, hideSystemTools)) continue;
+    if (seenFromEnd === reverseTarget) return message;
+    seenFromEnd += 1;
+  }
+  return undefined;
+}
+
+function boundaryBodyItemIndex(
+  messages: any[],
+  messageIndexById: ReadonlyMap<string, number>,
+  range: TaskBoundaryBodyRange,
+  itemCount: number,
+  hideSystemTools: boolean,
+  messageId: string,
+): number {
+  const messageIndex = messageIndexById.get(messageId);
+  if (messageIndex === undefined || !isIndexInTaskBoundaryBodyRange(range, messageIndex)) return -1;
+  const message = messages[messageIndex];
+  if (!isBoundaryBodyMessage(message, hideSystemTools)) return -1;
+  const forwardDistance = messageIndex - range.startIdx;
+  const backwardDistance = range.endIdx - messageIndex;
+  if (forwardDistance <= backwardDistance) {
+    let itemIndex = 0;
+    for (let index = range.startIdx; index < messageIndex; index += 1) {
+      if (isBoundaryBodyMessage(messages[index], hideSystemTools)) itemIndex += 1;
+    }
+    return itemIndex;
+  }
+  let itemsAfter = 0;
+  for (let index = Math.min(range.endIdx, messages.length - 1); index > messageIndex; index -= 1) {
+    if (isBoundaryBodyMessage(messages[index], hideSystemTools)) itemsAfter += 1;
+  }
+  return itemCount - 1 - itemsAfter;
+}
 
 function generateAttachmentId(): string {
   return `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -227,10 +397,15 @@ export function AgentPanel() {
   const isWorkflowRunningRef = useRef(false);
   const isStreaming = useAppSelector((s: RootState) => selectActiveConversation(s).isStreaming);
   const [isLoopRunning, setIsLoopRunning] = useState(false);
+  const liveAssistantRunIds = useMemo(() => new Set(
+    Object.values(conversation.assistantRuns)
+      .filter(run => isLiveAssistantRunStatus(run.status))
+      .map(run => run.id),
+  ), [conversation.assistantRuns]);
+  const isAgentRunActive = isStreaming || isLoopRunning || liveAssistantRunIds.size > 0;
+  const isAgentRunActiveRef = useRef(isAgentRunActive);
+  isAgentRunActiveRef.current = isAgentRunActive;
   const [agentLoopResetGeneration, setAgentLoopResetGeneration] = useState(0);
-  // ★ Plan_7 #6：keydown 当刻读最新流式态供 useAtMention runtimeMode getter（避免 hook 依赖频繁重建）。
-  const isStreamingRef = useRef(isStreaming);
-  isStreamingRef.current = isStreaming;
   // ★ #13：前台压缩进行中（驱动「压缩中」banner + 发送守卫）。
   const isCompacting = useAppSelector((s: RootState) => selectActiveConversation(s).isCompacting);
   const storeCompactingRef = useRef(isCompacting);
@@ -271,7 +446,7 @@ export function AgentPanel() {
     onSubmit: (opts) => { void handleSendRef.current(opts); },
     submitOnPlainEnter: false,
     sendKeyMode, // ★ C1：底部输入框按设置切换发送键
-    runtimeMode: () => isStreamingRef.current || isLoopRunning, // 工具轮间 streaming 会短暂归零，真实 loop 仍运行时也必须保留排队/插队键义。
+    runtimeMode: () => isAgentRunActiveRef.current, // 工具轮间 streaming 会短暂归零，真实 loop 仍运行时也必须保留排队/插队键义。
     onAfterMutate: () => setCanSend(!richRef.current?.isEmpty()),
   });
   const [activeAgentTab, setActiveAgentTab] = useState<AgentPanelTab>(readCheckpointAgentTab);
@@ -534,6 +709,11 @@ export function AgentPanel() {
     () => conversation.taskBoundaries?.some(boundary => boundary.status === 'active') ?? false,
     [conversation.taskBoundaries],
   );
+  const taskBoundaryTailFollowKey = useMemo(() => {
+    const boundaries = conversation.taskBoundaries ?? [];
+    const latest = boundaries[boundaries.length - 1];
+    return latest ? `${latest.id}:${latest.status}:${latest.steps.length}:${latest.endedAt ?? ''}` : '';
+  }, [conversation.taskBoundaries]);
   useEffect(() => {
     const toolTask = window.synapse?.toolTask;
     const shouldReconcile = toolTaskReferences.pendingTasks.length > 0
@@ -656,7 +836,7 @@ export function AgentPanel() {
       ? Math.max(0, Math.min(floorStepToRoundStart(rounds, rec.totalSteps), history.length - 1))
       : 0;
     const recordMd = rec ? buildStableRecordPrefix(rec, rootState.agentSettings.recordLayering) : '';
-    const projectedMessages = recordMd
+    const projectedHistory = recordMd
       ? [{ role: 'system', content: `[对话历史摘要]\n\n${recordMd}` }, ...history.slice(keepFrom)]
       : history;
     const selectionId = active.model || rootState.agentSettings.currentModel;
@@ -668,6 +848,18 @@ export function AgentPanel() {
     );
     const capabilities = runtime.option?.capabilities;
     const projectedMode = rootState.agentSettings.mode || 'planning';
+    const systemPrompt = promptBuilder.build({
+      workspaceName: rootState.workspace?.name || undefined,
+      mode: projectedMode,
+      promptInjection: rootState.settings.promptInjection,
+      conversationId: targetConversationId || AUTOSAVE_ID,
+      conversationIsDraft: !targetConversationId || targetConversationId === AUTOSAVE_ID,
+      goal: active.goal || undefined,
+    });
+    const projectedMessages = [
+      { role: 'system', content: systemPrompt },
+      ...projectedHistory,
+    ];
     const contextWindow = getModelContextWindowForOption(
       runtime.option,
       rootState.agentSettings.contextWindowOverrides?.[selectionId],
@@ -758,23 +950,36 @@ export function AgentPanel() {
         (state as any).settings.providerCredentials,
         (state as any).settings.apiEndpoints,
       );
-      if (!usage) {
-        await refreshProjectedTokenCount(conversationId, { allowApiOverride: true });
-        return;
-      }
       const record = await getRecord(conversationId).catch(() => null);
       if (isStale()) return;
       const catalogGeneration = runtime.option?.catalog?.generation;
       const compressionGeneration = String(record?.revision ?? 0);
       const credential = state.settings.providerCredentials[runtime.providerId];
-      const usageMatchesSelection = usage.providerId === runtime.providerId
-        && usage.modelId === runtime.modelId
-        && usage.conversationId === conversationId
-        && (usage.accountFingerprint ?? null) === (credential?.accountFingerprint ?? null)
-        && (usage.credentialGeneration ?? 0) === (credential?.credentialGeneration ?? 0)
-        && (!catalogGeneration || usage.catalogGeneration === catalogGeneration)
-        && usage.compressionGeneration === compressionGeneration;
-      if (!usageMatchesSelection) {
+      const liveRunIds = new Set(
+        Object.values(active.assistantRuns)
+          .filter(run => isLiveAssistantRunStatus(run.status))
+          .map(run => run.id),
+      );
+      const expectedUsageGeneration = {
+        conversationId,
+        providerId: runtime.providerId,
+        modelId: runtime.modelId,
+        accountFingerprint: credential?.accountFingerprint ?? null,
+        credentialGeneration: credential?.credentialGeneration ?? 0,
+        catalogGeneration,
+        compressionGeneration,
+      };
+      const activeRunIds = liveRunIds.size > 0 ? liveRunIds : undefined;
+      const usageMatchesSelection = tokenUsageMatchesCurrentGeneration(usage, {
+        ...expectedUsageGeneration,
+        liveRunIds: activeRunIds,
+      });
+      const preserveActiveUsage = tokenUsageMatchesCurrentGeneration(active.tokenUsage, {
+        ...expectedUsageGeneration,
+        liveRunIds,
+      });
+      if (isAgentRunActiveRef.current && preserveActiveUsage && !usageMatchesSelection) return;
+      if (!usage || !usageMatchesSelection) {
         await refreshProjectedTokenCount(conversationId, { allowApiOverride: true });
         return;
       }
@@ -850,37 +1055,43 @@ export function AgentPanel() {
   //   区间内的消息收进 TaskBoundaryCard（反重力式：一个折叠卡片包住整个任务过程），区间外的消息正常平铺。
   //   并聚合每个边界区间内的文件变更（diffs/artifacts，同 path 取最新）作卡片「已编辑文件」。
   //   anchor 已不在消息里的边界归 orphan（末尾兜底，不吞消息）。返回 startIdx→区间 的 Map 供渲染按下标命中。
+  const messageTopologyRevision = conversation.messageTopologyRevision;
+  const taskBoundaryTopologyRevision = conversation.taskBoundaryTopologyRevision ?? 0;
+  const taskBoundaryById = useMemo(() => {
+    const map = new Map<string, any>();
+    for (const boundary of (conversation.taskBoundaries ?? []) as any[]) {
+      if (typeof boundary.id === 'string') map.set(boundary.id, boundary);
+    }
+    return map;
+  }, [conversation.taskBoundaries]);
+
   const taskBoundaryRender = useMemo(() => {
     const boundaries = (conversation.taskBoundaries ?? []) as any[];
-    const startMap = new Map<number, { b: any; startIdx: number; endIdx: number }>();
+    const startMap = new Map<number, TaskBoundaryRenderRange>();
     const filesByBoundaryId = new Map<string, BoundaryFile[]>();
-    const orphans: any[] = [];
-    if (boundaries.length === 0) return { startMap, filesByBoundaryId, orphans };
+    const orphans: string[] = [];
+    const bodyRanges: TaskBoundaryRenderRange[] = [];
+    const emptyResult = {
+      startMap,
+      filesByBoundaryId,
+      orphans,
+      bodyRanges,
+      messageIndexById: new Map<string, number>() as ReadonlyMap<string, number>,
+      bodyRangeForMessageIndex: (_messageIndex: number) => undefined as TaskBoundaryRenderRange | undefined,
+      bodyRangeForMessageId: (_messageId: string) => undefined as TaskBoundaryRenderRange | undefined,
+    };
+    if (boundaries.length === 0) return emptyResult;
 
     const basename = (p: string) => (p || '').split(/[/\\]/).pop() || p;
     const msgIdToIdx = new Map<string, number>();
     messages.forEach((m: any, i: number) => msgIdToIdx.set(m.id, i));
 
-    const ranges: { b: any; startIdx: number; endIdx: number }[] = [];
+    const ranges: { b: any; boundaryId: string; startIdx: number; endIdx: number; anchorIdx: number }[] = [];
     for (const b of boundaries) {
-      const anchorIdx = b.anchorMessageId != null ? msgIdToIdx.get(b.anchorMessageId) : undefined;
-      if (anchorIdx === undefined) { orphans.push(b); continue; }
-      // ★ 反馈#1：卡片区间从 anchor（begin 那刻最后 assistant 消息＝开场白「我按流程来…」）的【下一条】开始，
-      //   开场白留卡片外/前，卡片只含 begin 之后的过程消息。渲染 IIFE 不变：i=anchorIdx 正常渲染开场白，i=startIdx 才触发卡片。
-      const startIdx = anchorIdx + 1;
-      // active（无 endAnchor）或 endAnchor 被截断不在 → 延伸到当前末尾；done 边界用 endAnchor 本身——
-      //   若 endAnchor < startIdx 表示 begin→end 间无过程的空任务，交由下方 startIdx>endIdx 跳过，不误延伸吞后文。
-      let endIdx = b.endAnchorMessageId != null ? msgIdToIdx.get(b.endAnchorMessageId) : undefined;
-      // ★ 主人反馈#3：只有【active】(进行中、本就该随新消息延伸) 才延伸到当前末尾；done/aborted 已收口的边界，
-      //   即便 endAnchor 缺失（旧数据未记 / 被截断清空 / 异常收口未设）也【绝不延伸吞后文】——否则收口后用户
-      //   新发的消息被并进已完成卡片（CDP 实测：done 边界 endAnchor=null → 卡片从 startIdx 吞到 messages 末尾）。
-      //   缺失时退化为空区间（endIdx<startIdx），下方 startIdx>endIdx 跳过该卡片、消息照常单独渲染（不折叠胜过误吞）。
-      if (b.status === 'active') {
-        if (b.endAnchorMessageId == null || endIdx === undefined) endIdx = messages.length - 1;
-      } else if (endIdx === undefined) {
-        endIdx = startIdx - 1;
-      }
-      ranges.push({ b, startIdx, endIdx });
+      if (typeof b.id !== 'string') continue;
+      const bodyRange = resolveTaskBoundaryBodyRange(b, msgIdToIdx, messages.length);
+      if (!bodyRange) { orphans.push(b.id); continue; }
+      ranges.push({ b, boundaryId: b.id, ...bodyRange });
     }
     // 防区间重叠（理论不重叠：begin 会收口前一个 active；保险按 startIdx 升序裁剪）。
     ranges.sort((a, c) => a.startIdx - c.startIdx);
@@ -888,7 +1099,21 @@ export function AgentPanel() {
     for (const r of ranges) {
       if (r.startIdx <= lastEnd) r.startIdx = lastEnd + 1;
       if (r.startIdx > r.endIdx || r.startIdx >= messages.length) continue;
-      startMap.set(r.startIdx, r);
+      const range: TaskBoundaryRenderRange = {
+        anchorIdx: r.anchorIdx,
+        startIdx: r.startIdx,
+        endIdx: r.endIdx,
+        boundaryId: r.boundaryId,
+        itemCount: countBoundaryBodyItems(messages as any[], r, agentSettings.hideSystemToolCalls ?? true),
+      };
+      startMap.set(r.startIdx, {
+        boundaryId: range.boundaryId,
+        anchorIdx: range.anchorIdx,
+        startIdx: range.startIdx,
+        endIdx: range.endIdx,
+        itemCount: range.itemCount,
+      });
+      bodyRanges.push(range);
       lastEnd = r.endIdx;
       // 聚合区间内文件变更：diff 同 path 取最新状态，artifact 同 path 去重。
       const files: BoundaryFile[] = [];
@@ -914,60 +1139,95 @@ export function AgentPanel() {
           }
         }
       }
-      filesByBoundaryId.set(r.b.id, files);
+      filesByBoundaryId.set(r.boundaryId, files);
     }
-    return { startMap, filesByBoundaryId, orphans };
-  }, [conversation.taskBoundaries, messages]);
+    const bodyRangeForMessageIndex = (messageIndex: number): TaskBoundaryRenderRange | undefined => {
+      let low = 0;
+      let high = bodyRanges.length - 1;
+      while (low <= high) {
+        const mid = Math.floor((low + high) / 2);
+        const range = bodyRanges[mid];
+        if (messageIndex < range.startIdx) high = mid - 1;
+        else if (messageIndex > range.endIdx) low = mid + 1;
+        else return range;
+      }
+      return undefined;
+    };
+    const bodyRangeForMessageId = (messageId: string): TaskBoundaryRenderRange | undefined => {
+      const messageIndex = msgIdToIdx.get(messageId);
+      return messageIndex === undefined ? undefined : bodyRangeForMessageIndex(messageIndex);
+    };
+    return {
+      startMap,
+      filesByBoundaryId,
+      orphans,
+      bodyRanges,
+      messageIndexById: msgIdToIdx as ReadonlyMap<string, number>,
+      bodyRangeForMessageIndex,
+      bodyRangeForMessageId,
+    };
+    // 流式正文和 steps/summary 每次更新都会替换对象引用；边界拓扑只随消息骨架或 boundary 锚点/状态变化重建。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentSettings.hideSystemToolCalls, messageTopologyRevision, messages.length, taskBoundaryTopologyRevision]);
 
   // 超长对话只挂载最近一段顶层消息单元；向上滚动时再按批补入更早内容。
   // Redux 仍保留完整历史作为真实数据源，窗口化只影响 React/DOM 投影，不改变消息、边界和压缩语义。
-  const messageRenderUnits = useMemo(() => {
+  const messageRenderProjection = useMemo(() => {
     const hideSysTools = agentSettings.hideSystemToolCalls ?? true;
     const units: MessageRenderUnit[] = [];
+    const unitIndexByMessageId = new Map<string, number>();
+    const unitIndexByBoundaryId = new Map<string, number>();
     let idx = 0;
     while (idx < messages.length) {
       const range = taskBoundaryRender.startMap.get(idx);
       if (range) {
-        units.push({ id: `tb-${range.b.id}`, startIdx: range.startIdx, endIdx: range.endIdx, boundary: range.b });
+        const unitIndex = units.length;
+        units.push({
+          id: `tb-${range.boundaryId}`,
+          startIdx: range.startIdx,
+          endIdx: range.endIdx,
+          boundaryId: range.boundaryId,
+          boundaryItemCount: range.itemCount,
+        });
+        unitIndexByBoundaryId.set(range.boundaryId, unitIndex);
         idx = range.endIdx + 1;
         continue;
       }
       const message: any = messages[idx];
       if (message.role !== 'tool' && !isEmptyAssistantMessage(message, hideSysTools)) {
+        const unitIndex = units.length;
         units.push({ id: message.id, startIdx: idx, endIdx: idx });
+        if (message.id) unitIndexByMessageId.set(message.id, unitIndex);
       }
       idx += 1;
     }
-    return units;
-  }, [agentSettings.hideSystemToolCalls, messages, taskBoundaryRender.startMap]);
-
-  const messageUnitIndexById = useMemo(() => {
-    const map = new Map<string, number>();
-    messageRenderUnits.forEach((unit, unitIndex) => {
-      for (let idx = unit.startIdx; idx <= unit.endIdx && idx < messages.length; idx++) {
-        const messageId = (messages[idx] as any)?.id;
-        if (messageId) map.set(messageId, unitIndex);
-      }
-    });
-    return map;
-  }, [messageRenderUnits, messages]);
+    return { units, unitIndexByMessageId, unitIndexByBoundaryId };
+    // `messages` 引用会随流式正文/step 内容替换；这里仅依赖消息数量与 topology revision。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentSettings.hideSystemToolCalls, messageTopologyRevision, messages.length, taskBoundaryRender.startMap]);
+  const messageRenderUnits = messageRenderProjection.units;
+  const messageUnitIndexById = messageRenderProjection.unitIndexByMessageId;
+  const boundaryUnitIndexById = messageRenderProjection.unitIndexByBoundaryId;
 
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
+  const isNearTailRef = useRef(true);
   const lastMessagesScrollTopRef = useRef(0);
   const scrollPersistTimerRef = useRef<number | null>(null);
   const liveConversationIdRef = useRef(conversationId);
-  const [boundaryRevealRequest, setBoundaryRevealRequest] = useState<{ boundaryId: string; messageId: string; nonce: number } | null>(null);
+  const [boundaryRevealRequest, setBoundaryRevealRequest] = useState<{ boundaryId: string; messageId?: string; stepId?: string; nonce: number } | null>(null);
   const messageWindow = useMessageWindow({
     units: messageRenderUnits,
     containerRef: messagesContainerRef,
     conversationId,
     active: activeAgentTab === 'chat',
     isAtBottomRef,
+    isNearTailRef,
     initialUnits: INITIAL_MESSAGE_RENDER_UNITS,
     maxUnits: MAX_MESSAGE_RENDER_UNITS,
     batchUnits: MESSAGE_RENDER_UNIT_BATCH,
     estimatedUnitHeight: ESTIMATED_MESSAGE_RENDER_UNIT_HEIGHT,
+    tailUnpinThresholdPx: TAIL_UNPIN_THRESHOLD_PX,
   });
   const {
     range: messageWindowRange,
@@ -993,6 +1253,18 @@ export function AgentPanel() {
   effectiveVisibleMessageUnitStartRef.current = effectiveVisibleMessageUnitStart;
   effectiveVisibleMessageUnitEndRef.current = effectiveVisibleMessageUnitEnd;
 
+  const resolveMessageRenderUnit = useCallback((messageId: string): { unitIndex?: number; unit?: MessageRenderUnit } => {
+    const directUnitIndex = messageUnitIndexById.get(messageId);
+    if (directUnitIndex !== undefined) {
+      return { unitIndex: directUnitIndex, unit: messageRenderUnits[directUnitIndex] };
+    }
+    const bodyRange = taskBoundaryRender.bodyRangeForMessageId(messageId);
+    if (!bodyRange) return {};
+    const boundaryUnitIndex = boundaryUnitIndexById.get(bodyRange.boundaryId);
+    if (boundaryUnitIndex === undefined) return {};
+    return { unitIndex: boundaryUnitIndex, unit: messageRenderUnits[boundaryUnitIndex] };
+  }, [boundaryUnitIndexById, messageRenderUnits, messageUnitIndexById, taskBoundaryRender]);
+
   // 导航目标可能尚未挂载：先扩展渲染窗口，再按消息锚点定位和闪烁。
   const scrollToMessage = useCallback((messageId: string) => {
     const reveal = () => {
@@ -1008,10 +1280,9 @@ export function AgentPanel() {
       element.classList.add('message-nav-flash');
       window.setTimeout(() => element.classList.remove('message-nav-flash'), 1200);
     };
-    const targetUnitIndex = messageUnitIndexById.get(messageId);
-    const targetUnit = targetUnitIndex === undefined ? undefined : messageRenderUnits[targetUnitIndex];
-    if (targetUnit?.boundary) {
-      setBoundaryRevealRequest({ boundaryId: targetUnit.boundary.id, messageId, nonce: Date.now() });
+    const { unitIndex: targetUnitIndex, unit: targetUnit } = resolveMessageRenderUnit(messageId);
+    if (targetUnit?.boundaryId) {
+      setBoundaryRevealRequest({ boundaryId: targetUnit.boundaryId, messageId, nonce: Date.now() });
     }
     if (
       targetUnitIndex !== undefined
@@ -1025,12 +1296,11 @@ export function AgentPanel() {
       return;
     }
     reveal();
-    if (targetUnit?.boundary) window.setTimeout(reveal, 80);
+    if (targetUnit?.boundaryId) window.setTimeout(reveal, 80);
   }, [
     effectiveVisibleMessageUnitEnd,
     effectiveVisibleMessageUnitStart,
-    messageRenderUnits,
-    messageUnitIndexById,
+    resolveMessageRenderUnit,
     setMessageWindowForIndex,
   ]);
 
@@ -1038,28 +1308,26 @@ export function AgentPanel() {
     setBoundaryRevealRequest(current => current?.nonce === nonce ? null : current);
   }, []);
 
+  const findBoundaryIdForStep = useCallback((stepId: string): string | undefined => {
+    for (const boundary of (conversationRef.current.taskBoundaries ?? []) as any[]) {
+      if (boundary.steps?.some((step: any) => step?.id === stepId)) return boundary.id;
+    }
+    return undefined;
+  }, []);
+
   // ★ H6（M8 第七轮反馈）：消息导航项 —— 取所有带 subtitle 的【用户消息】，排除落在 task_boundary
-  //   区间（anchorMessageId..endAnchorMessageId）内的消息（边界内消息已被 TaskBoundaryCard 折叠，不单列导航）。
+  //   body 区间（anchorMessageId 后一条..endAnchorMessageId）内的消息（边界内消息已被 TaskBoundaryCard 折叠，不单列导航）。
   //   active 边界（无 endAnchor）视为延伸到当前末尾。返回 { id, subtitle, seq } 列表，供浮层渲染与跳转。
   const navItems = useMemo(() => {
-    const boundaries = (conversation.taskBoundaries ?? []) as any[];
-    const msgIdToIdx = new Map<string, number>();
-    messages.forEach((m: any, i: number) => msgIdToIdx.set(m.id, i));
-    // 计算被 boundary 覆盖的消息下标集合（含区间端点；anchor 本身＝边界开场白也算覆盖内，不单列）。
-    const coveredIdx = new Set<number>();
-    for (const b of boundaries) {
-      const startIdx = b.anchorMessageId != null ? msgIdToIdx.get(b.anchorMessageId) : undefined;
-      if (startIdx === undefined) continue; // anchor 已不在消息里（被截断）→ 该边界不参与覆盖判断
-      let endIdx = b.endAnchorMessageId != null ? msgIdToIdx.get(b.endAnchorMessageId) : undefined;
-      // ★ 主人反馈#3 一致性：done/aborted 已收口边界即便 endAnchor 缺失也不延伸到末尾（否则收口后 user 消息被
-      //   误判落在覆盖区间、从导航里漏掉）。仅 active 才延伸。
-      if (b.status === 'active') {
-        if (b.endAnchorMessageId == null || endIdx === undefined) endIdx = messages.length - 1;
-      } else if (endIdx === undefined) {
-        endIdx = startIdx - 1;
+    const coveredRanges = taskBoundaryRender.bodyRanges;
+    let coveredRangeCursor = 0;
+    const isCoveredByBoundary = (idx: number): boolean => {
+      while (coveredRangeCursor < coveredRanges.length && coveredRanges[coveredRangeCursor].endIdx < idx) {
+        coveredRangeCursor += 1;
       }
-      for (let i = startIdx; i <= endIdx && i < messages.length; i++) coveredIdx.add(i);
-    }
+      const range = coveredRanges[coveredRangeCursor];
+      return Boolean(range && isIndexInTaskBoundaryBodyRange(range, idx));
+    };
     // ★ #12b：item 带原始消息下标 idx，供导航浮层在压缩点边界处插入「— 压缩点 —」分隔行。
     const items: Array<{ id: string; subtitle: string; seq: number; timestamp?: number; idx: number }> = [];
     let seq = 0;
@@ -1068,34 +1336,35 @@ export function AgentPanel() {
     //   ② 「模型开始回复才生成本轮导航」: 仅当该轮已出现【非空 / 流式中的 assistant】(AI 真的开始回复) 才收录,
     //      杜绝「连发一堆 user 还没回复就冒一堆导航项」与「发不出的孤立 user 也生成导航」。
     //   轮首判定: 一条 user, 其前一条【非 tool】消息不是 user(是 assistant 或序列开头)→ 本条是轮首。
-    const prevNonToolIsUser = (idx: number) => {
-      for (let j = idx - 1; j >= 0; j--) {
-        const r = (messages[j] as any).role;
-        if (r !== 'tool') return r === 'user';
-      }
-      return false; // 序列开头 → 本条是轮首
-    };
+    // 超长对话里不能为每条 user 回头扫描前序 tool 消息；维护前一个非 tool 角色即可单趟完成。
+    let previousNonToolRole: string | null = null;
     let roundFirstUserIdx = -1;
     let roundCollected = false;
     messages.forEach((m: any, i: number) => {
-      if (m.role === 'user') {
-        if (!prevNonToolIsUser(i)) { roundFirstUserIdx = i; roundCollected = false; } // 轮首 user（连发的后续 user 不更新）
+      const role = m.role;
+      if (role === 'tool') return;
+      if (role === 'user') {
+        if (previousNonToolRole !== 'user') { roundFirstUserIdx = i; roundCollected = false; } // 轮首 user（连发的后续 user 不更新）
+        previousNonToolRole = 'user';
         return;
       }
       // 本轮首条【非空 / 流式中】assistant 出现 = AI 已开始回复本轮 → 收录该轮首 user（仅一次）。
-      if (m.role === 'assistant' && !roundCollected && roundFirstUserIdx >= 0
+      if (role === 'assistant' && !roundCollected && roundFirstUserIdx >= 0
           && ((((m.content as string) || '').trim().length > 0) || m.isStreaming)) {
         roundCollected = true;
         const fu: any = messages[roundFirstUserIdx];
         const subtitle = fu.subtitle as string | undefined;
-        if (!subtitle) return;                          // 轮首无小标题（纯附件/未生成）→ 不收录
-        if (coveredIdx.has(roundFirstUserIdx)) return;  // 轮首落在 task_boundary 区间内（已折叠）→ 不收录
-        seq += 1;
-        items.push({ id: fu.id, subtitle, seq, timestamp: fu.timestamp, idx: roundFirstUserIdx });
+        if (subtitle && !isCoveredByBoundary(roundFirstUserIdx)) {
+          seq += 1;
+          items.push({ id: fu.id, subtitle, seq, timestamp: fu.timestamp, idx: roundFirstUserIdx });
+        }
       }
+      previousNonToolRole = typeof role === 'string' ? role : null;
     });
     return items;
-  }, [conversation.taskBoundaries, messages]);
+    // `messages` 与 taskBoundary 对象会随正文/steps/summary 替换；导航只跟消息骨架和 boundary 拓扑走。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messageTopologyRevision, messages.length, taskBoundaryRender.bodyRanges]);
 
   // ★ #12b：导航浮层压缩点行 —— 把 batchDividerByIdx（压缩点挂在哪个消息下标前）的下标
   //   收成升序数组，渲染时在「上一项 idx < 压缩点下标 <= 当前项 idx」的位置前插一行「— 压缩点 —」，
@@ -1119,33 +1388,6 @@ export function AgentPanel() {
   const restoringScrollRef = useRef(false);
   // ★ M6：inputRef 移除（textarea→RichTextInput，命令式句柄用 richRef）。
   const agentLoopRef = useRef<AgentLoop | null>(null);
-  // ★ 权限弹窗前端化（诊断#4）：审批浮层状态 + pending Promise resolve（替代原生 window.confirm）。
-  const [approvalReq, setApprovalReq] = useState<ApprovalRequest | null>(null);
-  const handleApprovalApprove = useCallback(() => {
-    if (approvalReq) approvalCoordinator.resolve(approvalReq.id, true);
-  }, [approvalReq]);
-  const handleApprovalReject = useCallback(() => {
-    if (approvalReq) approvalCoordinator.resolve(approvalReq.id, false);
-  }, [approvalReq]);
-
-  useEffect(() => approvalCoordinator.subscribe(ticket => {
-    const sourceConversation = ticket?.conversationId
-      ? selectConversationById(store.getState() as RootState, ticket.conversationId)
-      : null;
-    const conversationLabel = ticket?.conversationId
-      ? `${sourceConversation?.title || '未命名对话'} · ${ticket.conversationId.slice(-8)}`
-      : '未命名对话';
-    setApprovalReq(ticket ? {
-      id: ticket.id,
-      toolName: ticket.toolName,
-      level: ticket.level,
-      argsText: ticket.argsText,
-      originLabel: ticket.originLabel,
-      conversationLabel,
-      message: ticket.message,
-    } : null);
-  }), []);
-
   // ★ M6：autoResize useLayoutEffect 移除——RichTextInput 内部自管高度（onInput/rAF + CSS max-height）。
   const availableModels = useMemo(() => agentSettings.availableModels ?? [], [agentSettings.availableModels]);
   const currentProviderModel = useMemo(
@@ -1352,18 +1594,15 @@ export function AgentPanel() {
     let checkpoint: ChatScrollCheckpoint;
     try {
       const containerRect = current.getBoundingClientRect();
-      const visibleAnchorCandidates = [...current.querySelectorAll<HTMLElement>('[data-message-id], [data-task-boundary-id]')]
-        .filter(candidate => {
-          const candidateRect = candidate.getBoundingClientRect();
-          return candidateRect.bottom > containerRect.top + 1
-            && candidateRect.top < containerRect.bottom - 1;
-        });
-      const anchorElement = visibleAnchorCandidates.find(candidate => candidate.dataset.messageId)
-        ?? visibleAnchorCandidates[0];
+      const anchorElement = selectChatScrollCheckpointAnchorElement(current, containerRect);
+      const stepBoundaryId = anchorElement?.dataset.taskStepId
+        ? anchorElement.closest<HTMLElement>('[data-task-boundary-id]')?.dataset.taskBoundaryId
+        : undefined;
       const anchor: ChatScrollCheckpoint['anchor'] = anchorElement ? {
-        kind: anchorElement.dataset.messageId ? 'message' : 'boundary',
-        id: anchorElement.dataset.messageId ?? anchorElement.dataset.taskBoundaryId,
-        offset: anchorElement.getBoundingClientRect().top - containerRect.top,
+        kind: anchorElement.dataset.messageId ? 'message' : anchorElement.dataset.taskStepId ? 'step' : 'boundary',
+        id: anchorElement.dataset.messageId ?? anchorElement.dataset.taskStepId ?? anchorElement.dataset.taskBoundaryId,
+        boundaryId: stepBoundaryId,
+        offset: clampChatScrollAnchorOffset(anchorElement.getBoundingClientRect().top - containerRect.top, current.clientHeight),
       } : undefined;
       checkpoint = {
         scrollTop: current.scrollTop,
@@ -1397,14 +1636,23 @@ export function AgentPanel() {
       return;
     }
     const bottomDistancePx = el.scrollHeight - el.scrollTop - el.clientHeight;
-    isAtBottomRef.current = nextTailPinnedState({
-      scrollTop: el.scrollTop,
-      previousScrollTop: lastMessagesScrollTopRef.current,
-      bottomDistancePx,
-      currentTailPinned: isAtBottomRef.current,
-      pinThresholdPx: TAIL_PIN_THRESHOLD_PX,
-      unpinThresholdPx: TAIL_UNPIN_THRESHOLD_PX,
-    });
+    const scrollTopUnchanged = Math.abs(el.scrollTop - lastMessagesScrollTopRef.current) <= 1;
+    const contentGrowthWhilePinned = isAtBottomRef.current && scrollTopUnchanged && bottomDistancePx > TAIL_PIN_THRESHOLD_PX;
+    if (contentGrowthWhilePinned) {
+      isNearTailRef.current = true;
+      isAtBottomRef.current = true;
+      el.scrollTop = el.scrollHeight;
+    } else {
+      isNearTailRef.current = Number.isFinite(bottomDistancePx) && bottomDistancePx <= TAIL_UNPIN_THRESHOLD_PX;
+      isAtBottomRef.current = nextTailPinnedState({
+        scrollTop: el.scrollTop,
+        previousScrollTop: lastMessagesScrollTopRef.current,
+        bottomDistancePx,
+        currentTailPinned: isAtBottomRef.current,
+        pinThresholdPx: TAIL_PIN_THRESHOLD_PX,
+        unpinThresholdPx: TAIL_UNPIN_THRESHOLD_PX,
+      });
+    }
     lastMessagesScrollTopRef.current = el.scrollTop;
     if (isAtBottomRef.current && canLoadNewerMessageUnits) jumpToLatestMessageWindow();
     // ★ B2（反馈#10）：chat tab 滚动时持续记录位置，切走再切回时据此恢复。
@@ -1491,6 +1739,7 @@ export function AgentPanel() {
     const el = messagesContainerRef.current;
     if (el) {
       el.scrollTop = el.scrollHeight;
+      isNearTailRef.current = true;
       lastMessagesScrollTopRef.current = el.scrollTop;
       if (activeAgentTab === 'chat') chatScrollTopRef.current = el.scrollTop;
     }
@@ -1500,6 +1749,7 @@ export function AgentPanel() {
     messageWindowRange.end,
     messageWindowRange.start,
     messageWindowTopSpacerHeight,
+    taskBoundaryTailFollowKey,
     messages,
     isStreaming,
   ]);
@@ -1514,8 +1764,12 @@ export function AgentPanel() {
       lastMessagesScrollTopRef.current = el.scrollTop;
       return;
     }
-    if (isAtBottomRef.current) el.scrollTop = el.scrollHeight;
-    else el.scrollTop = chatScrollTopRef.current;
+    if (isAtBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+      isNearTailRef.current = true;
+    } else {
+      el.scrollTop = chatScrollTopRef.current;
+    }
     lastMessagesScrollTopRef.current = el.scrollTop;
   }, [activeAgentTab, conversationId]);
 
@@ -1526,6 +1780,7 @@ export function AgentPanel() {
     restoredScrollConversationRef.current = conversationId;
     const restoreDefaultTail = () => {
       isAtBottomRef.current = true;
+      isNearTailRef.current = true;
       chatScrollTopRef.current = 0;
       restoringScrollRef.current = true;
       jumpToLatestMessageWindow();
@@ -1555,7 +1810,7 @@ export function AgentPanel() {
         atBottom?: boolean;
         visibleUnitStart?: number;
         visibleUnitEnd?: number;
-        anchor?: { kind?: 'message' | 'boundary'; id?: string; offset?: number };
+        anchor?: { kind?: 'message' | 'boundary' | 'step'; id?: string; boundaryId?: string; offset?: number };
       };
       const restoredStart = Math.max(0, Math.min(Number(restored.visibleUnitStart) || 0, messageRenderUnits.length - 1));
       const restoredEnd = Math.max(
@@ -1565,33 +1820,53 @@ export function AgentPanel() {
           messageRenderUnits.length,
         ),
       );
+      const restoredStepBoundaryId = restored.anchor?.kind === 'step' && restored.anchor.id
+        ? restored.anchor.boundaryId ?? findBoundaryIdForStep(restored.anchor.id)
+        : undefined;
+      const restoredMessageUnit = restored.anchor?.kind === 'message' && restored.anchor.id
+        ? resolveMessageRenderUnit(restored.anchor.id)
+        : undefined;
       const anchorUnitIndex = restored.anchor?.id
         ? restored.anchor.kind === 'message'
-          ? messageUnitIndexById.get(restored.anchor.id)
-          : messageRenderUnits.findIndex(unit => unit.boundary?.id === restored.anchor?.id)
+          ? restoredMessageUnit?.unitIndex
+          : restored.anchor.kind === 'step'
+            ? messageRenderUnits.findIndex(unit => unit.boundaryId === restoredStepBoundaryId)
+            : messageRenderUnits.findIndex(unit => unit.boundaryId === restored.anchor?.id)
         : undefined;
       const anchorUnit = anchorUnitIndex !== undefined && anchorUnitIndex >= 0
-        ? messageRenderUnits[anchorUnitIndex]
+        ? restoredMessageUnit?.unit ?? messageRenderUnits[anchorUnitIndex]
         : undefined;
-      if (restored.anchor?.kind === 'message' && restored.anchor.id && anchorUnit?.boundary) {
+      const restoreViewportHeight = messagesContainerRef.current?.clientHeight ?? 0;
+      const canUseStoredAnchorOffset = restored.anchor?.id
+        ? isChatScrollAnchorOffsetWithinViewportBand(restored.anchor.offset, restoreViewportHeight)
+        : false;
+      if (restored.anchor?.kind === 'message' && restored.anchor.id && anchorUnit?.boundaryId) {
         setBoundaryRevealRequest({
-          boundaryId: anchorUnit.boundary.id,
+          boundaryId: anchorUnit.boundaryId,
           messageId: restored.anchor.id,
+          nonce: Date.now(),
+        });
+      } else if (restored.anchor?.kind === 'step' && restored.anchor.id && restoredStepBoundaryId) {
+        setBoundaryRevealRequest({
+          boundaryId: restoredStepBoundaryId,
+          stepId: restored.anchor.id,
           nonce: Date.now(),
         });
       }
       const nextStart = anchorUnitIndex !== undefined && anchorUnitIndex >= 0
         ? Math.max(0, anchorUnitIndex - 8)
         : restoredStart;
+      const fallbackWindowStart = canUseStoredAnchorOffset ? nextStart : restoredStart;
       isAtBottomRef.current = restored.atBottom === true;
+      isNearTailRef.current = restored.atBottom === true;
       chatScrollTopRef.current = Math.max(0, Number(restored.scrollTop) || 0);
       restoringScrollRef.current = true;
       if (restored.atBottom) {
         jumpToLatestMessageWindow();
-      } else if (anchorUnitIndex !== undefined && anchorUnitIndex >= 0) {
+      } else if (canUseStoredAnchorOffset && anchorUnitIndex !== undefined && anchorUnitIndex >= 0) {
         setMessageWindowForIndex(anchorUnitIndex, { before: 8 });
       } else {
-        setMessageWindowRange({ start: nextStart, end: restoredEnd });
+        setMessageWindowRange({ start: fallbackWindowStart, end: restoredEnd });
       }
       requestAnimationFrame(() => requestAnimationFrame(() => {
         if (liveConversationIdRef.current !== conversationId) {
@@ -1605,20 +1880,37 @@ export function AgentPanel() {
         }
         if (isAtBottomRef.current) {
           container.scrollTop = container.scrollHeight;
+          isNearTailRef.current = true;
           lastMessagesScrollTopRef.current = container.scrollTop;
           chatScrollTopRef.current = container.scrollTop;
           restoringScrollRef.current = false;
           return;
         }
 
-        if (!restored.anchor?.id || !anchorUnit) {
-          container.scrollTop = chatScrollTopRef.current;
+        const applyScrollTopFallback = () => {
+          const restoredScrollTop = clampChatScrollTopForRestore(
+            chatScrollTopRef.current,
+            container.scrollHeight,
+            container.clientHeight,
+          );
+          container.scrollTop = restoredScrollTop;
           lastMessagesScrollTopRef.current = container.scrollTop;
+          chatScrollTopRef.current = container.scrollTop;
+        };
+
+        if (!restored.anchor?.id || !anchorUnit) {
+          applyScrollTopFallback();
           restoringScrollRef.current = false;
           return;
         }
 
-        const desiredOffset = Number(restored.anchor?.offset) || 0;
+        if (!isChatScrollAnchorOffsetWithinViewportBand(restored.anchor?.offset, container.clientHeight)) {
+          applyScrollTopFallback();
+          restoringScrollRef.current = false;
+          return;
+        }
+
+        const desiredOffset = clampChatScrollAnchorOffset(restored.anchor?.offset, container.clientHeight);
         let attempts = 0;
         let stableAlignments = 0;
         let anchorEverFound = false;
@@ -1632,11 +1924,14 @@ export function AgentPanel() {
             restoringScrollRef.current = false;
             return;
           }
-          const anchorElement = [...currentContainer.querySelectorAll<HTMLElement>('[data-message-id], [data-task-boundary-id]')]
+          const anchorElement = [...currentContainer.querySelectorAll<HTMLElement>('[data-message-id], [data-task-step-id], [data-task-boundary-id]')]
             .find(candidate => (
               restored.anchor?.kind === 'message'
                 ? candidate.dataset.messageId === restored.anchor?.id
-                : candidate.dataset.taskBoundaryId === restored.anchor?.id
+                : restored.anchor?.kind === 'step'
+                  ? candidate.dataset.taskStepId === restored.anchor?.id
+                    && (!restoredStepBoundaryId || candidate.closest<HTMLElement>('[data-task-boundary-id]')?.dataset.taskBoundaryId === restoredStepBoundaryId)
+                  : candidate.dataset.taskBoundaryId === restored.anchor?.id
             ));
           attempts += 1;
           if (anchorElement) {
@@ -1657,8 +1952,7 @@ export function AgentPanel() {
             if (anchorEverFound) {
               restoringScrollRef.current = false;
             } else {
-              currentContainer.scrollTop = chatScrollTopRef.current;
-              lastMessagesScrollTopRef.current = currentContainer.scrollTop;
+              applyScrollTopFallback();
               restoringScrollRef.current = false;
             }
             return;
@@ -1674,8 +1968,9 @@ export function AgentPanel() {
     activeAgentTab,
     conversationId,
     jumpToLatestMessageWindow,
+    findBoundaryIdForStep,
     messageRenderUnits,
-    messageUnitIndexById,
+    resolveMessageRenderUnit,
     setMessageWindowForIndex,
     setMessageWindowRange,
   ]);
@@ -1790,8 +2085,12 @@ export function AgentPanel() {
             // 主进程或数据库短暂未就绪时保留上次对话指针，不能把瞬时失败误判成已删除。
           }
           if (!confirmedMissing) {
-            await new Promise(resolve => window.setTimeout(resolve, 250));
-            data = await loadConversationSnapshot(selectedConversationId);
+            for (const retryDelayMs of [250, 750, 1500]) {
+              await new Promise(resolve => window.setTimeout(resolve, retryDelayMs));
+              if (cancelled || store.getState().conversationHistory.selectedId !== selectedConversationId) return;
+              data = await loadConversationSnapshot(selectedConversationId);
+              if (data) break;
+            }
           }
           if (!data && confirmedMissing) {
             dispatch(setSelectedId(null));
@@ -1816,7 +2115,10 @@ export function AgentPanel() {
         const selectionStillCurrent = store.getState().conversationHistory.selectedId
           === (restoredPersistedConversation ? selectedConversationId : null);
         const liveConversation = conversationRef.current;
-        if (!cancelled && selectionStillCurrent && restoredMessages.length > 0 && (liveConversation?.messages.length ?? 0) === 0) {
+        const shouldRestoreSnapshot = restoredPersistedConversation
+          ? Boolean(data?.id)
+          : restoredMessages.length > 0;
+        if (!cancelled && selectionStillCurrent && shouldRestoreSnapshot && (liveConversation?.messages.length ?? 0) === 0) {
           const restoredModel = data?.model || model;
           dispatch(setConversation({
             id: data?.id || 'autosave-current',
@@ -2474,7 +2776,7 @@ export function AgentPanel() {
     if (group.activeDiffs.length === 0) return;
     const conv = conversationRef.current;
     const latest = group.activeDiffs[group.activeDiffs.length - 1];
-    const pathKeys = await reviewPathKeys(latest.path, latest.contextId, runtimeConversationId);
+    const pathKeys = await reviewPathKeys(latest.path, latest.contextId, latest.conversationId ?? runtimeConversationId, latest.reviewPath);
     const editorTab = editorTabs.find(tab =>
       tab.filePath &&
       tab.content !== undefined &&
@@ -2552,8 +2854,8 @@ export function AgentPanel() {
     return true;
   }, [currentCapabilities?.vision, dispatch]);
 
-  const dispatchUserSend = useCallback((args: { text: string; tokens: ExtractedToken[]; readyAttachments: AttachmentRef[] }): 'sent' | 'handled' | 'blocked' => {
-    const { text, tokens, readyAttachments } = args;
+  const dispatchUserSend = useCallback((args: { text: string; tokens: ExtractedToken[]; readyAttachments: AttachmentRef[]; continuationTaskBoundary?: InterruptContinuationTaskBoundary }): 'sent' | 'handled' | 'blocked' => {
+    const { text, tokens, readyAttachments, continuationTaskBoundary } = args;
 
     if (!validateAttachmentAdmission(text, readyAttachments)) return 'blocked';
 
@@ -2595,14 +2897,14 @@ export function AgentPanel() {
       void (async () => {
         const injectedContext = await buildContextFromTokens(tokens).catch(() => '');
         try {
-          await agentLoopRef.current!.run(text, { contentParts, attachments: attachmentsForRun, richTokens: richTokensForRun, injectedContext: injectedContext || undefined });
+          await agentLoopRef.current!.run(text, { contentParts, attachments: attachmentsForRun, richTokens: richTokensForRun, injectedContext: injectedContext || undefined, continuationTaskBoundary });
         } catch (err: any) {
           dispatch(addNotification({ type: 'error', title: 'AI 请求失败', message: err?.message || '未知错误' }));
         }
       })();
       return 'sent';
     }
-    agentLoopRef.current!.run(text, { contentParts, attachments: attachmentsForRun, richTokens: richTokensForRun }).catch((err: any) => {
+    agentLoopRef.current!.run(text, { contentParts, attachments: attachmentsForRun, richTokens: richTokensForRun, continuationTaskBoundary }).catch((err: any) => {
       dispatch(addNotification({ type: 'error', title: 'AI 请求失败', message: err.message || '未知错误' }));
     });
     return 'sent';
@@ -2697,7 +2999,12 @@ export function AgentPanel() {
     //   agentLoop 工具轮间会 setStreaming(false) 让 isStreaming【假性归零】，此时若按 isStreaming 走下方「立即发送」
     //   分支，会先清空输入再 run()，而 run() 命中重入闸（this.running 仍 true）只弹通知就 return → 用户输入静默丢失。
     //   改用 isStreaming||isRunning：run 全程（含工具轮间）都走双队列，绝不静默丢消息。
-    if (isStreaming || isLoopRunning) {
+    // Stop 会先把前端 streaming/ref 复位，再等待旧执行器真正退出。这个间隙仍属于同一对话的
+    // 「安全收尾期」：新输入必须像普通运行中一样进入可见队列，不能清空输入后在 AgentLoop
+    // 的 activateOwner 等待里隐身。旧 run finally 释放 registry 后会按正常下降沿自动 drain。
+    const hasRunningOrSettlingAgent = isAgentRunActiveRef.current
+      || executionRegistry.isConversationRunning(targetConversationId);
+    if (hasRunningOrSettlingAgent) {
       const withModifier = opts?.withModifier === true;
       const target: 'queue' | 'interrupt' = withModifier
         ? (runtimeEnterAction === 'queue' ? 'interrupt' : 'queue')
@@ -2739,7 +3046,7 @@ export function AgentPanel() {
     richRef.current?.clear(); setCanSend(false);
     setPendingAttachments([]);
     setPreviewAttachment(null);
-  }, [pendingAttachments, isStreaming, isLoopRunning, runtimeEnterAction, queuedMessages.length, interruptMessages.length, hasApiKey, hasModel, buildUserContentParts, dispatchUserSend, closeMenu, dispatch, validateAttachmentAdmission]);
+  }, [pendingAttachments, runtimeEnterAction, queuedMessages.length, interruptMessages.length, hasApiKey, hasModel, buildUserContentParts, dispatchUserSend, closeMenu, dispatch, validateAttachmentAdmission]);
 
   const validateQueuedDrainAdmission = useCallback((
     targetConversationId: string,
@@ -2782,9 +3089,10 @@ export function AgentPanel() {
     const activeConversationId = selectActiveConversation(rootState).id || AUTOSAVE_ID;
     const targetLoop = (activeConversationId === targetConversationId ? agentLoopRef.current : null)
       ?? executionRegistry.getLoop<AgentLoop>(targetConversationId);
+    const targetRunActive = hasLiveAssistantRun(targetBucket.assistantRuns);
     const earlyBlock = queueDrainBlockReason({
       isStreaming: targetBucket.isStreaming,
-      isRunning: targetLoop?.isRunning ?? false,
+      isRunning: (targetLoop?.isRunning ?? false) || targetRunActive,
       hasPendingToolTasks: hasPendingToolTaskWork(targetBucket),
       hasHistoryMutation: Boolean(historyMutationInFlightRef.current),
       hasRunnableModel: targetRuntime.ready && Boolean(targetRuntime.modelId),
@@ -2808,9 +3116,10 @@ export function AgentPanel() {
     const latestLoop = (latestActiveConversationId === targetConversationId ? agentLoopRef.current : null)
       ?? executionRegistry.getLoop<AgentLoop>(targetConversationId)
       ?? targetLoop;
+    const latestRunActive = hasLiveAssistantRun(latestBucket.assistantRuns);
     const lateBlock = queueDrainBlockReason({
       isStreaming: latestBucket.isStreaming,
-      isRunning: latestLoop?.isRunning ?? false,
+      isRunning: (latestLoop?.isRunning ?? false) || latestRunActive,
       hasPendingToolTasks: hasPendingToolTaskWork(latestBucket),
       hasHistoryMutation: Boolean(historyMutationInFlightRef.current),
       hasRunnableModel: targetRuntime.ready && Boolean(targetRuntime.modelId),
@@ -2835,21 +3144,37 @@ export function AgentPanel() {
     const specialIndex = normalizedBatch.findIndex(({ message }) => (
       /^\//.test(message.text.trim()) || !!parseMultiAITrigger(message.text)
     ));
+    const resolveInterruptContinuation = (bucket: any): InterruptContinuationTaskBoundary | undefined => {
+      const activeBoundary = bucket.taskBoundaries?.find((boundary: any) => boundary.status === 'active');
+      return interruptContinuationFromBoundary(activeBoundary)
+        ?? queueDrainCoordinator.peekInterruptContinuation(targetConversationId);
+    };
 
     if (specialIndex === 0) {
       if (latestActiveConversationId !== targetConversationId) {
         return { status: 'blocked', reason: 'special-background-blocked' };
       }
       const item = normalizedBatch[0];
+      const continuationTaskBoundary = item.source === 'interrupt'
+        ? resolveInterruptContinuation(latestBucket)
+        : undefined;
+      const activeBoundary = latestBucket.taskBoundaries?.find((boundary: any) => boundary.status === 'active');
+      if (continuationTaskBoundary) {
+        if (activeBoundary) {
+          dispatch(endTaskBoundary({ id: continuationTaskBoundary.previousBoundaryId, status: 'interrupted', conversationId: targetConversationId }));
+        }
+      }
       const result = dispatchUserSend({
         text: item.message.text,
         tokens: item.message.richTokens ?? [],
         readyAttachments: item.readyAttachments,
+        continuationTaskBoundary,
       });
       if (result === 'blocked') return { status: 'blocked', reason: 'attachment-blocked' };
       dispatch(item.source === 'interrupt'
         ? dequeueInterrupt({ id: item.message.id, conversationId: targetConversationId })
         : dequeueMessage({ id: item.message.id, conversationId: targetConversationId }));
+      if (continuationTaskBoundary) queueDrainCoordinator.clearInterruptContinuation(targetConversationId);
       return { status: result === 'handled' ? 'handled' : 'started', continueImmediately: result === 'handled' };
     }
 
@@ -2867,9 +3192,10 @@ export function AgentPanel() {
     const beforeRunState = store.getState() as RootState;
     const beforeRunBucket = selectConversationById(beforeRunState, targetConversationId);
     const beforeRunLoop = executionRegistry.getLoop<AgentLoop>(targetConversationId) ?? latestLoop;
+    const beforeRunActive = hasLiveAssistantRun(beforeRunBucket.assistantRuns);
     const beforeRunBlock = queueDrainBlockReason({
       isStreaming: beforeRunBucket.isStreaming,
-      isRunning: beforeRunLoop?.isRunning ?? false,
+      isRunning: (beforeRunLoop?.isRunning ?? false) || beforeRunActive,
       hasPendingToolTasks: hasPendingToolTaskWork(beforeRunBucket),
       hasHistoryMutation: Boolean(historyMutationInFlightRef.current),
       hasRunnableModel: targetRuntime.ready && Boolean(targetRuntime.modelId),
@@ -2887,10 +3213,17 @@ export function AgentPanel() {
           ? dequeueInterrupt({ id: item.message.id, conversationId: targetConversationId })
           : dequeueMessage({ id: item.message.id, conversationId: targetConversationId }));
       }
+      if (continuationTaskBoundary) queueDrainCoordinator.clearInterruptContinuation(targetConversationId);
     };
     const boundaryMode = queueDrainBoundaryMode(sendBatch);
-    if (boundaryMode === 'aborted') {
-      dispatch(endTaskBoundary({ aborted: true, conversationId: targetConversationId }));
+    const continuationTaskBoundary = boundaryMode === 'interrupted'
+      ? resolveInterruptContinuation(beforeRunBucket)
+      : undefined;
+    const beforeRunActiveBoundary = beforeRunBucket.taskBoundaries?.find((boundary: any) => boundary.status === 'active');
+    if (continuationTaskBoundary) {
+      if (beforeRunActiveBoundary) {
+        dispatch(endTaskBoundary({ id: continuationTaskBoundary.previousBoundaryId, status: 'interrupted', conversationId: targetConversationId }));
+      }
     } else if (boundaryMode === 'done') {
       dispatch(endTaskBoundary({ conversationId: targetConversationId }));
     }
@@ -2907,6 +3240,7 @@ export function AgentPanel() {
           richTokens: item.message.richTokens,
         })),
         injectedContext: injectedContexts.filter(Boolean).join('\n\n') || undefined,
+        continuationTaskBoundary,
         onUserMessagesAccepted: removeAcceptedItems,
       });
       return { status: 'started' };
@@ -2924,7 +3258,8 @@ export function AgentPanel() {
 
   useEffect(() => {
     queueDrainCoordinator.requestDrain(runtimeConversationId, 'foreground-idle');
-  }, [runtimeConversationId, isStreaming, isLoopRunning, historyMutationLabel, queuedMessages, interruptMessages, hasApiKey, hasModel, activeBpcUi.state, toolTaskReferences.pendingTasks.length, toolTaskReferences.orphanPendingCallIds.size]);
+    queueDrainCoordinator.retryPending('foreground-idle');
+  }, [runtimeConversationId, isStreaming, isLoopRunning, liveAssistantRunIds.size, historyMutationLabel, queuedMessages, interruptMessages, hasApiKey, hasModel, activeBpcUi.state, toolTaskReferences.pendingTasks.length, toolTaskReferences.orphanPendingCallIds.size]);
 
   const handleStop = useCallback(async () => {
     // ★ M3-2b 修复（high）：Stop 按钮要同时管「普通对话」与「@MultiAI 工作流」两条路。
@@ -2934,6 +3269,9 @@ export function AgentPanel() {
     //   - agentOrchestrator.abortAll()：abort workflowAbortController（让 runWorkflow 在下个节点前 return aborted）
     //       + 杀在途子代理；无运行工作流时 abortAll 内部全是 optional-chain/空集合遍历，安全 no-op。
     //   abortAll 后 runWorkflow 返回 aborted 结果，照常走 outcome.kind==='ran' 插「无法推进」汇总，闭环正常。
+    const activeAgentLoop = agentLoopRef.current;
+    activeAgentLoop?.stop();
+    approvalCoordinator.cancelConversation(conversationId);
     queueDrainCoordinator.cancelDrain(conversationId);
     const stopConversation = executionRegistry.stopConversation(conversationId);
     agentLoopRef.current = null;
@@ -2960,6 +3298,11 @@ export function AgentPanel() {
     requestAnimationFrame(() => richRef.current?.focus());
     await Promise.allSettled([stopConversation, stopWorkflow, stopBpc]);
   }, [dispatch, clearQueueWithRelease, conversationId]);
+
+  useEffect(
+    () => approvalCoordinator.registerStopHandler(conversationId, handleStop),
+    [conversationId, handleStop],
+  );
 
   // Plan_4 M2-1：编辑/重试/回溯会截断后续消息。把 record 水位线 clamp 到保留范围（替代此前的整条删）：
   // 覆盖区在保留范围内则不动；否则 clamp totalRounds/totalSteps/lastUpdatedRound，保住 M 之前已生成的摘要、
@@ -3038,10 +3381,28 @@ export function AgentPanel() {
   const isHistoryMutationBlocked = useCallback(() => Boolean(
     conversationRef.current.isStreaming
     || agentLoopRef.current?.isRunning
+    // Stop 后 UI 会立即解锁，但旧工具可能仍在确认取消或返回迟到结果。只要 registry 仍持有
+    // 该 run，就禁止 Withdraw/Edit/Retry/Delete，避免先删 owner message、后收到孤儿 Diff。
+    || executionRegistry.isConversationRunning(conversationId)
+    || toolTaskReferences.pendingTasks.length > 0
+    || toolTaskReferences.orphanPendingCallIds.size > 0
     || isWorkflowRunningRef.current
     || storeCompactingRef.current
     || historyMutationInFlightRef.current
-  ), []);
+  ), [conversationId, toolTaskReferences.orphanPendingCallIds.size, toolTaskReferences.pendingTasks.length]);
+
+  const canLaunchHistoricalReplay = useCallback((targetConversationId: string, targetLoop: AgentLoop | null): targetLoop is AgentLoop => {
+    const activeConversationId = conversationRef.current.id || AUTOSAVE_ID;
+    return Boolean(
+      targetLoop
+      && activeConversationId === targetConversationId
+      && agentLoopRef.current === targetLoop
+      && !executionRegistry.isConversationRunning(targetConversationId)
+      && toolTaskReferences.pendingTasks.length === 0
+      && toolTaskReferences.orphanPendingCallIds.size === 0
+      && !historyMutationInFlightRef.current
+    );
+  }, [toolTaskReferences.orphanPendingCallIds.size, toolTaskReferences.pendingTasks.length]);
 
   const beginHistoryMutation = useCallback((label: string): boolean => {
     if (isHistoryMutationBlocked()) {
@@ -3050,7 +3411,9 @@ export function AgentPanel() {
         title: '暂时不能修改历史',
         message: historyMutationInFlightRef.current
           ? `请等待「${historyMutationInFlightRef.current}」完成`
-          : '请等待当前生成、工作流或压缩完成',
+          : toolTaskReferences.pendingTasks.length > 0 || toolTaskReferences.orphanPendingCallIds.size > 0
+            ? '请等待后台工具任务完成恢复对账'
+            : '请等待当前生成、工作流或压缩完成',
       }));
       return false;
     }
@@ -3204,6 +3567,7 @@ export function AgentPanel() {
     // skipUserMessage 重发：agentLoop 从 store 编辑后消息的 contentParts/attachments 还原图发 API（M2-R6 R6-2c）。
       if (targetLoop) {
         setTimeout(() => {
+          if (!canLaunchHistoricalReplay(targetConversationId, targetLoop)) return;
           targetLoop.run(newContent, { skipUserMessage: true }).catch((err: any) => {
             dispatch(addNotification({ type: 'error', title: 'AI 请求失败', message: err.message }));
           });
@@ -3214,7 +3578,7 @@ export function AgentPanel() {
     }).finally(() => {
       endHistoryMutation('编辑消息');
     });
-  }, [dispatch, invalidateRecordForTruncation, invalidateRequestLedgerForHistoryMutation, refreshProjectedTokenCount, gcMessages, buildUserContentParts, isHistoryMutationBlocked, validateAttachmentAdmission, beginHistoryMutation, endHistoryMutation]);
+  }, [dispatch, invalidateRecordForTruncation, invalidateRequestLedgerForHistoryMutation, refreshProjectedTokenCount, gcMessages, buildUserContentParts, isHistoryMutationBlocked, validateAttachmentAdmission, beginHistoryMutation, endHistoryMutation, canLaunchHistoricalReplay]);
 
   // ★ Plan_5 M5-4 重试（规范 §5）：入口改挂【user 消息】（不再挂 AI 消息）。
   //   点某条 user 的「重新生成」= 回溯到该 user 所在轮（截断该 user 段之后全部，含本轮 model 段所有
@@ -3319,6 +3683,7 @@ export function AgentPanel() {
       // ⑥ 自动重发该 user（不填输入框）：skipUserMessage=true → 不新增 user 消息，直接用 store 现有历史发起请求。
       if (targetLoop) {
         setTimeout(() => {
+          if (!canLaunchHistoricalReplay(targetConversationId, targetLoop)) return;
           targetLoop.run((retryUserMsg as any)?.content ?? '', { skipUserMessage: true }).catch((err: any) => {
             dispatch(addNotification({ type: 'error', title: 'AI 请求失败', message: err.message }));
           });
@@ -3329,7 +3694,7 @@ export function AgentPanel() {
     }).finally(() => {
       endHistoryMutation('重新生成');
     });
-  }, [dispatch, gcMessages, invalidateRequestLedgerForHistoryMutation, refreshProjectedTokenCount, isHistoryMutationBlocked, validateAttachmentAdmission, beginHistoryMutation, endHistoryMutation]);
+  }, [dispatch, gcMessages, invalidateRequestLedgerForHistoryMutation, refreshProjectedTokenCount, isHistoryMutationBlocked, validateAttachmentAdmission, beginHistoryMutation, endHistoryMutation, canLaunchHistoricalReplay]);
 
   // Delete single message
   const handleDelete = useCallback((msgId: string) => {
@@ -3340,13 +3705,13 @@ export function AgentPanel() {
     const targetIndex = targetConversation.messages.findIndex((m: any) => m.id === msgId);
     const target = targetConversation.messages[targetIndex];
     if (!target || targetIndex < 0) return;
+    const messageIndexById = new Map<string, number>();
+    targetConversation.messages.forEach((message: any, index: number) => {
+      if (typeof message.id === 'string') messageIndexById.set(message.id, index);
+    });
     const belongsToBoundary = (targetConversation.taskBoundaries ?? []).some((boundary: any) => {
-      const startIndex = targetConversation.messages.findIndex((message: any) => message.id === boundary.anchorMessageId);
-      if (startIndex < 0 || targetIndex < startIndex) return false;
-      const endIndex = boundary.endAnchorMessageId
-        ? targetConversation.messages.findIndex((message: any) => message.id === boundary.endAnchorMessageId)
-        : (boundary.status === 'active' ? targetConversation.messages.length - 1 : startIndex - 1);
-      return endIndex >= startIndex && targetIndex <= endIndex;
+      const bodyRange = resolveTaskBoundaryBodyRange(boundary, messageIndexById, targetConversation.messages.length);
+      return Boolean(bodyRange && isIndexInTaskBoundaryBodyRange(bodyRange, targetIndex));
     });
     const hasStatefulPayload = (target.diffs?.length ?? 0) > 0
       || (target.toolCalls?.length ?? 0) > 0
@@ -3492,26 +3857,66 @@ export function AgentPanel() {
     if (!beginHistoryMutation('从此分支')) return;
     // ★ M2-6 切换竞态：autosave 源分支会 clearAutosaveSnapshot()+promotion(fork 真实 id)+setConversation，
     //   与切换/新建同构，置闸覆盖整段，挡住旧对话迟到 autosave debounce 复活 AUTOSAVE_ID 草稿。finally 复位。
-    beginConversationSwitch();
+    const switchEpoch = beginConversationSwitch();
     void (async () => {
+      const sourceConversation = conversationRef.current;
+      const selectedConversationIdAtStart = store.getState().conversationHistory.selectedId;
+      const sourceSnapshot = {
+        id: (sourceConversation.id as string | null) || null,
+        title: sourceConversation.title,
+        messages: [...(sourceConversation.messages ?? [])],
+        model: sourceConversation.model || agentMetaRef.current.model,
+        mode: agentMetaRef.current.mode,
+        reasoningEffort: agentMetaRef.current.reasoningEffort,
+        assistantRuns: { ...(sourceConversation.assistantRuns ?? {}) },
+        fileSnapshots: { ...(sourceConversation.fileSnapshots ?? {}) },
+        pendingDiffs: [...((sourceConversation.pendingDiffs as FileDiffSummary[]) ?? [])],
+        workspacePath: sourceConversation.workspacePath ?? null,
+        goal: sourceConversation.goal,
+        bpcThresholdOverride: sourceConversation.bpcThresholdOverride,
+        compactThresholdOverride: sourceConversation.compactThresholdOverride,
+        taskBoundaries: sourceConversation.taskBoundaries ? [...sourceConversation.taskBoundaries] : undefined,
+        taskHeadline: sourceConversation.taskHeadline,
+      };
+      const sourceConversationIds = new Set<string>([sourceSnapshot.id || AUTOSAVE_ID]);
+      let branchTargetId: string | null = null;
+      const selectedConversationStillMatches = (expectedId: string) => {
+        const selectedId = store.getState().conversationHistory.selectedId;
+        if (expectedId === AUTOSAVE_ID) {
+          return (selectedId ?? AUTOSAVE_ID) === (selectedConversationIdAtStart ?? AUTOSAVE_ID);
+        }
+        return selectedId === expectedId;
+      };
+      const activeConversationId = () => (conversationRef.current.id as string | null) || AUTOSAVE_ID;
+      const isBranchSourceStillCurrent = () => {
+        if (!isConversationSwitchCurrent(switchEpoch)) return false;
+        const liveId = activeConversationId();
+        return sourceConversationIds.has(liveId) && selectedConversationStillMatches(liveId);
+      };
+      const isBranchTargetStillCurrent = (targetId: string) => {
+        if (!isConversationSwitchCurrent(switchEpoch)) return false;
+        return activeConversationId() === targetId && store.getState().conversationHistory.selectedId === targetId;
+      };
       try {
-        const snapshotMessages = conversationRef.current.messages;
+        const snapshotMessages = sourceSnapshot.messages;
         if (!snapshotMessages.length) return;
+        if (!isBranchSourceStillCurrent()) return;
         // ★ M4-2-S5 分支继承归属：抓一份稳定的源对话工作区归属（null=Global），供 promotion 落库 / 新分支
         //   create / 两处 setConversation 回填复用——新分支与源对话同归属（path 作键）。
-        const srcWorkspacePath = conversationRef.current.workspacePath ?? null;
+        const srcWorkspacePath = sourceSnapshot.workspacePath;
         // ★ task_boundary 分支继承：抓一份稳定的源对话任务边界 + 大标题（与 srcWorkspacePath 同源 conversationRef.current），
         //   边界是对话顶层字段、不在 messages 里，故必须经 branchConversation 的 meta 透传（不能从子集 messages 推）。
         //   branchConversation 内部会按分支点裁剪 + active 收口 + 深拷贝，回带 result.taskBoundaries/taskHeadline 供切入回填。
-        const srcTaskBoundaries = conversationRef.current.taskBoundaries;
-        const srcTaskHeadline = conversationRef.current.taskHeadline;
-        const srcBpcThresholdOverride = conversationRef.current.bpcThresholdOverride;
-        const srcCompactThresholdOverride = conversationRef.current.compactThresholdOverride;
+        const srcTaskBoundaries = sourceSnapshot.taskBoundaries;
+        const srcTaskHeadline = sourceSnapshot.taskHeadline;
+        const srcBpcThresholdOverride = sourceSnapshot.bpcThresholdOverride;
+        const srcCompactThresholdOverride = sourceSnapshot.compactThresholdOverride;
 
         // 1. 确定稳定的源 id：autosave 源先 fork 成真实 id（与「新对话」fork 同款，clearAutosave 不 release，refCount 守恒）。
         //    recordSrcId 记住 record 当前实际所在的 id（promotion 前的 id）——fork 不迁移 record，故 copyRecord 须从这里读。
-        const recordSrcId = (conversationRef.current.id as string | null) || AUTOSAVE_ID;
+        const recordSrcId = sourceSnapshot.id || AUTOSAVE_ID;
         await bpcScheduler.discardCurrent(recordSrcId, 'Fork 只继承分支点之前已发布的压缩历史');
+        if (!isBranchSourceStillCurrent()) return;
         let srcId = recordSrcId;
         // ★ issue④⑤修复：autosave 源分支时，下面的 clearAutosaveSnapshot() 在 Electron 会经 SQLite FK CASCADE
         //   级联删掉 `records WHERE conversation_id='autosave-current'`。之后 branchConversation 再去现读 record
@@ -3521,12 +3926,14 @@ export function AgentPanel() {
         //    branchConversation 回退按 recordSrcId 现读。）
         let recordSnapshot: Awaited<ReturnType<typeof getRecord>> | undefined;
         let generationSnapshot: Awaited<ReturnType<typeof getContextGenerationState>> | undefined;
-        const wasAutosave = !conversationRef.current.id || conversationRef.current.id === AUTOSAVE_ID;
+        const wasAutosave = !sourceSnapshot.id || sourceSnapshot.id === AUTOSAVE_ID;
         if (wasAutosave) {
           // 在 clearAutosaveSnapshot 触发 FK CASCADE 之前抓取源 record 与 generation 内存快照。
           // generation 是压缩水位、冷却、熔断和 hard-pause 的正式状态，不能因释放 message.id 主键而丢失。
           recordSnapshot = await getRecord(recordSrcId).catch(() => null);
+          if (!isBranchSourceStillCurrent()) return;
           generationSnapshot = await getContextGenerationState(recordSrcId).catch(() => null);
+          if (!isBranchSourceStillCurrent()) return;
           // ★ M2-3 主键修复（核心）：messages.id 是全局 UNIQUE 主键。promotion 把当前 autosave 草稿
           //   提升为真实源对话——saveConversationSnapshot(id=AUTOSAVE_ID) 会 createConversationId() 落到【新真实 id】，
           //   并 replaceMessages(新id, 带原 message.id 的消息)。此时若 `autosave-current` 行仍占着同一批 message.id，
@@ -3536,29 +3943,31 @@ export function AgentPanel() {
           //   里按 message.id 的反向指针（AssistantRun.messageId / AssistantRunEvent.messageId）零破坏，源对话运行态完整。
           //   安全：消息体已抓进局部 snapshotMessages（不依赖 DB autosave 行），先删 autosave 行不影响 save。
           await clearAutosaveSnapshot({ preserveLocalMirror: true });
+          if (!isBranchSourceStillCurrent()) return;
           const saved = await saveConversationSnapshot({
-            id: conversationRef.current.id,
-            title: conversationRef.current.title,
+            id: sourceSnapshot.id,
+            title: sourceSnapshot.title,
             messages: snapshotMessages,
-            model: conversationRef.current.model || agentMetaRef.current.model,
+            model: sourceSnapshot.model,
             // M2-6：promotion（autosave 源提升为真实对话）随对话落当前 mode / reasoningEffort。
-            mode: agentMetaRef.current.mode,
-            reasoningEffort: agentMetaRef.current.reasoningEffort,
-            assistantRuns: conversationRef.current.assistantRuns,
-            fileSnapshots: conversationRef.current.fileSnapshots,
-            pendingDiffs: conversationRef.current.pendingDiffs,
+            mode: sourceSnapshot.mode,
+            reasoningEffort: sourceSnapshot.reasoningEffort,
+            assistantRuns: sourceSnapshot.assistantRuns,
+            fileSnapshots: sourceSnapshot.fileSnapshots,
+            pendingDiffs: sourceSnapshot.pendingDiffs,
             // ★ M4-2-S5：promotion（autosave 源提升为真实对话）随对话落工作区归属，使源对话保留其归属，
             //   下方 branchConversation 也据此继承。
             workspacePath: srcWorkspacePath,
             // ★ review HIGH 修复：promotion 此前漏传 goal/taskBoundaries/taskHeadline → 提升出的源对话落库这些列为 NULL，
             //   日后从历史切回源对话时目标与任务边界永久丢失。与其它三个 save 入口口径对齐补全。
-            goal: conversationRef.current.goal,
+            goal: sourceSnapshot.goal,
             bpcThresholdOverride: srcBpcThresholdOverride,
             compactThresholdOverride: srcCompactThresholdOverride,
             taskBoundaries: srcTaskBoundaries,
             taskHeadline: srcTaskHeadline,
             timestamp: Date.now(),
           });
+          if (!isBranchSourceStillCurrent()) return;
           // 前置条件：autosave 源必须先 promotion 成稳定真实 id 才能作为 parent。
           // 若落库失败（saved 为 null）或仍是 AUTOSAVE_ID（理论不会，防御），则【中止分支】——
           // 绝不带着 AUTOSAVE_ID/null 作 parentId 继续 branchConversation（那会让溯源指针悬空/指向会被复用的 id）。
@@ -3577,29 +3986,33 @@ export function AgentPanel() {
               batches: recordSnapshot.batches,
               schemaVersion: recordSnapshot.schemaVersion,
             });
+            if (!isBranchSourceStillCurrent()) return;
             if (!restoredRecord) throw new Error('Record restoration failed during autosave promotion');
             restoredRecordRevision = restoredRecord.revision;
           }
           await migrateForkedConversation(recordSrcId, saved.id, generationSnapshot, restoredRecordRevision);
+          if (!isBranchSourceStillCurrent()) return;
           // 真实源、Record 与 generation 均已落库后才移除 localStorage 恢复镜像。
           // 若进程在此前退出，下一次启动仍可从镜像恢复 autosave，不会出现 clear-before-save 数据丢失。
           await clearAutosaveSnapshot();
+          if (!isBranchSourceStillCurrent()) return;
+          sourceConversationIds.add(saved.id);
           srcId = saved.id;
           dispatch(updateConversation(saved));
           // 把当前 store 身份切到真实源 id（消息不变）。autosave 镜像已在 save 前 clearAutosaveSnapshot
           // 清掉（为释放 message.id 主键占用，见上），此处无需再清。
           dispatch(setConversation({
             id: srcId,
-            title: conversationRef.current.title,
+            title: sourceSnapshot.title,
             messages: snapshotMessages,
-            model: conversationRef.current.model || agentMetaRef.current.model,
-            assistantRuns: conversationRef.current.assistantRuns,
-            fileSnapshots: conversationRef.current.fileSnapshots,
-            pendingDiffs: conversationRef.current.pendingDiffs,
+            model: sourceSnapshot.model,
+            assistantRuns: sourceSnapshot.assistantRuns,
+            fileSnapshots: sourceSnapshot.fileSnapshots,
+            pendingDiffs: sourceSnapshot.pendingDiffs,
             // ★ M4-2-S5：promotion 切到真实源 id 时保持源对话工作区归属（身份变化的 setConversation 须显式带）。
             workspacePath: srcWorkspacePath,
             // ★ review HIGH 修复：身份变化的 setConversation 须显式带 goal/taskBoundaries/taskHeadline，否则切到真实 id 时 store 丢边界。
-            goal: conversationRef.current.goal,
+            goal: sourceSnapshot.goal,
             bpcThresholdOverride: srcBpcThresholdOverride,
             compactThresholdOverride: srcCompactThresholdOverride,
             taskBoundaries: srcTaskBoundaries,
@@ -3612,11 +4025,11 @@ export function AgentPanel() {
         //    parent = 稳定 srcId；record 优先用 autosave 级联删除前抓的内存快照（issue④⑤），
         //    否则（真实对话分支，未抓快照）回退按 recordSrcId 现读。
         const result = await branchConversation(srcId, msgId, snapshotMessages, {
-          title: conversationRef.current.title,
-          model: conversationRef.current.model || agentMetaRef.current.model,
+          title: sourceSnapshot.title,
+          model: sourceSnapshot.model,
           // M2-6：把当前 mode / reasoningEffort 传入，新分支 DB 行一开始即继承源设置（切回不退回默认）。
-          mode: agentMetaRef.current.mode,
-          reasoningEffort: agentMetaRef.current.reasoningEffort,
+          mode: sourceSnapshot.mode,
+          reasoningEffort: sourceSnapshot.reasoningEffort,
           // ★ M4-2-S5：新分支 DB 行一开始即继承源对话工作区归属（path 作键，缺省 null=Global）。
           workspacePath: srcWorkspacePath,
           bpcThresholdOverride: srcBpcThresholdOverride,
@@ -3628,10 +4041,12 @@ export function AgentPanel() {
           recordSrcId,
           ...(wasAutosave ? { recordSnapshot } : {}),
         });
+        if (!isBranchSourceStillCurrent()) return;
         if (!result) {
           dispatch(addNotification({ type: 'error', title: '分支失败', message: '无法从此消息分支为新对话' }));
           return;
         }
+        branchTargetId = result.newId;
 
         // 3. 历史列表加入新对话条目 + 切换到新对话。
         dispatch(updateConversation(result.summary));
@@ -3670,11 +4085,14 @@ export function AgentPanel() {
           for (const sha of shasToHold) {
             try {
               const added = await platform.attachment.addRef(sha);
+              if (!isBranchTargetStillCurrent(branchTargetId)) return;
               if ('error' in added && added.error) pendingAddRefFailedShas.push(sha);
             } catch {
+              if (!isBranchTargetStillCurrent(branchTargetId)) return;
               pendingAddRefFailedShas.push(sha);
             }
           }
+          if (!isBranchTargetStillCurrent(branchTargetId)) return;
           const failed = new Set(pendingAddRefFailedShas);
           refillInputFromUserMessage({
             ...pu,
@@ -3694,7 +4112,12 @@ export function AgentPanel() {
           dispatch(addNotification({ type: 'success', title: '已分支', message: '已分支为新对话（源对话保留不变）' }));
         }
       } catch (err: any) {
-        dispatch(addNotification({ type: 'error', title: '分支失败', message: err?.message || '从此分支时出错' }));
+        const canNotifyFailure = branchTargetId
+          ? isBranchTargetStillCurrent(branchTargetId)
+          : isBranchSourceStillCurrent();
+        if (canNotifyFailure) {
+          dispatch(addNotification({ type: 'error', title: '分支失败', message: err?.message || '从此分支时出错' }));
+        }
       } finally {
         endConversationSwitch();
         endHistoryMutation('从此分支');
@@ -3779,12 +4202,12 @@ export function AgentPanel() {
   //   isStreaming 时返回上次缓存值（有 API 实测 apiTokenCount 时本就优先用实测），停流后重算一次。
   const lastLocalTokenRef = useRef<{ count: number; exact: boolean }>({ count: 0, exact: true });
   const localToken = useMemo(() => {
-    if (isStreaming) return lastLocalTokenRef.current;
+    if (isAgentRunActive) return lastLocalTokenRef.current;
     if (!messages.length) { lastLocalTokenRef.current = { count: 0, exact: true }; return lastLocalTokenRef.current; }
     const v = countConversationTokensExact(messages.map((m: any) => ({ role: m.role, content: m.content })), model);
     lastLocalTokenRef.current = v;
     return v;
-  }, [messages, model, isStreaming]);
+  }, [messages, model, isAgentRunActive]);
   const hasTrackedToken = tokenCountSource !== 'none';
   const tokenCount = hasTrackedToken ? trackedTokenCount : localToken.count;
   const tokenExact = tokenCountSource === 'api' || (tokenCountSource === 'none' && localToken.exact);
@@ -3850,7 +4273,7 @@ export function AgentPanel() {
   }, [filteredModelOptions, model, modelMenuOpen]);
 
   const handleSelectModel = useCallback((nextModel: string) => {
-    if (isStreaming || agentLoopRef.current?.isRunning) {
+    if (isAgentRunActiveRef.current) {
       setModelMenuOpen(false);
       dispatch(addNotification({
         type: 'info',
@@ -3879,7 +4302,7 @@ export function AgentPanel() {
       message: nextModel,
       duration: 2000,
     }));
-  }, [dispatch, isStreaming, model, refreshProjectedTokenCount]);
+  }, [dispatch, model, refreshProjectedTokenCount]);
 
   const focusModelOption = useCallback((nextIndex: number) => {
     if (filteredModelOptions.length === 0) return;
@@ -4199,7 +4622,6 @@ export function AgentPanel() {
     })();
   }, [dispatch, editorTabs]);
 
-  const isAgentRunActive = isStreaming || isLoopRunning;
   const toggleModelMenu = () => {
     if (isAgentRunActive) {
       dispatch(addNotification({
@@ -4215,7 +4637,6 @@ export function AgentPanel() {
 
   return (
     <div className="agent-panel glass-panel">
-      <ApprovalDialog request={approvalReq} onApprove={handleApprovalApprove} onReject={handleApprovalReject} />
       <div className="agent-header">
         <div className="agent-tabs">
           <button className={`agent-tab ${activeAgentTab === 'chat' ? 'active' : ''}`} onClick={() => selectAgentTab('chat')}>💬 Chat</button>
@@ -4541,7 +4962,7 @@ export function AgentPanel() {
                       timestamp={msg.timestamp}
                       model={(msg as any).model}
                       isStreaming={(msg as any).isStreaming}
-                      historyActionsDisabled={Boolean(isStreaming || isLoopRunning || isWorkflowRunningRef.current)}
+                      historyActionsDisabled={Boolean(isAgentRunActive || isWorkflowRunningRef.current)}
                       streamState={(msg as any).streamState}
                       streamMode={(msg as any).streamMode}
                       fallbackReason={(msg as any).fallbackReason}
@@ -4573,38 +4994,53 @@ export function AgentPanel() {
                   const hideSysTools = agentSettings.hideSystemToolCalls ?? true;
                   const out: any[] = [];
                   for (const { unit, index: unitIndex } of visibleMessageRenderUnits) {
-                    const r = unit.boundary
-                      ? { b: unit.boundary, startIdx: unit.startIdx, endIdx: unit.endIdx }
+                    const r = unit.boundaryId
+                      ? {
+                          boundaryId: unit.boundaryId,
+                          b: taskBoundaryById.get(unit.boundaryId),
+                          anchorIdx: unit.startIdx - 1,
+                          startIdx: unit.startIdx,
+                          endIdx: unit.endIdx,
+                          itemCount: unit.boundaryItemCount ?? 0,
+                        }
                       : null;
                     let content: ReactNode = null;
-                    if (r) {
-                      // 边界区间 → 收进卡片（过滤 tool + 完全无内容的空 assistant 消息后作 children 过程消息）。
-                      const rangeMsgs: any[] = [];
-                      for (let j = r.startIdx; j <= r.endIdx && j < messages.length; j++) {
-                        const m: any = messages[j];
-                        if (m.role !== 'tool' && !isEmptyAssistantMessage(m, hideSysTools)) rangeMsgs.push(m);
-                      }
+                    if (r?.b) {
                       const startDivider = batchDividerByIdx.get(r.startIdx);
                       content = (
                         <Fragment>
                           {startDivider && <CompactDivider marks={startDivider} />}
                           <TaskBoundaryCard
+                            conversationId={conversation.id}
                             boundary={r.b}
                             files={filesByBoundaryId.get(r.b.id) ?? []}
-                             onOpenFile={handleOpenBoundaryFile}
-                             childCount={rangeMsgs.length}
-                             items={rangeMsgs}
-                             renderItem={(item) => renderBubble(item)}
-                             followTail={isAtBottomRef.current}
-                             revealItemId={boundaryRevealRequest && boundaryRevealRequest.boundaryId === r.b.id
-                               ? boundaryRevealRequest.messageId
-                               : undefined}
-                             revealNonce={boundaryRevealRequest && boundaryRevealRequest.boundaryId === r.b.id
-                               ? boundaryRevealRequest.nonce
-                               : undefined}
-                             onRevealConsumed={handleBoundaryRevealConsumed}
-                              onEnd={() => dispatch(endTaskBoundary({ id: r.b.id }))}
-                            />
+                            onOpenFile={handleOpenBoundaryFile}
+                            childCount={r.itemCount}
+                            itemCount={r.itemCount}
+                            itemAt={(index) => boundaryBodyItemAt(messages as any[], r, r.itemCount, hideSysTools, index)}
+                            itemIdAt={(index) => (boundaryBodyItemAt(messages as any[], r, r.itemCount, hideSysTools, index) as any)?.id}
+                            findItemIndex={(messageId) => boundaryBodyItemIndex(
+                              messages as any[],
+                              taskBoundaryRender.messageIndexById,
+                              r,
+                              r.itemCount,
+                              hideSysTools,
+                              messageId,
+                            )}
+                            renderItem={(item) => renderBubble(item)}
+                            followTail={isAtBottomRef.current}
+                            revealItemId={boundaryRevealRequest && boundaryRevealRequest.boundaryId === r.b.id
+                              ? boundaryRevealRequest.messageId
+                              : undefined}
+                            revealStepId={boundaryRevealRequest && boundaryRevealRequest.boundaryId === r.b.id
+                              ? boundaryRevealRequest.stepId
+                              : undefined}
+                            revealNonce={boundaryRevealRequest && boundaryRevealRequest.boundaryId === r.b.id
+                              ? boundaryRevealRequest.nonce
+                              : undefined}
+                            onRevealConsumed={handleBoundaryRevealConsumed}
+                            onEnd={() => dispatch(endTaskBoundary({ id: r.b.id }))}
+                          />
                         </Fragment>
                       );
                     } else {
@@ -4630,9 +5066,14 @@ export function AgentPanel() {
                   return out;
                 })()}
                 {canLoadNewerMessageUnits && (
-                  <button type="button" className="message-history-loader" onClick={loadNewerMessageUnits}>
-                    加载更新内容 · 距最新还剩 {messageRenderUnits.length - effectiveVisibleMessageUnitEnd} 个任务或消息块
-                  </button>
+                  <>
+                    <button type="button" className="message-history-loader" onClick={loadNewerMessageUnits}>
+                      加载更新内容 · 距最新还剩 {messageRenderUnits.length - effectiveVisibleMessageUnitEnd} 个任务或消息块
+                    </button>
+                    <button type="button" className="message-history-loader" onClick={jumpToLatestMessageWindow}>
+                      跳到最新
+                    </button>
+                  </>
                 )}
                 {messageWindowBottomSpacerHeight > 0 && (
                   <div
@@ -4644,9 +5085,10 @@ export function AgentPanel() {
               </>
             )}
             {/* ★ task_boundary 兜底：anchor 已不在消息列表的孤儿边界（回溯截断残留等）渲染为无消息体卡片，不丢信息。 */}
-            {taskBoundaryRender.orphans.map((b: any) => (
-              <TaskBoundaryCard key={b.id} boundary={b} childCount={0} />
-            ))}
+            {taskBoundaryRender.orphans.map((boundaryId: string) => {
+              const boundary = taskBoundaryById.get(boundaryId);
+              return boundary ? <TaskBoundaryCard key={boundary.id} conversationId={conversation.id} boundary={boundary} childCount={0} /> : null;
+            })}
             <div ref={messagesEndRef} />
           </>
         )}

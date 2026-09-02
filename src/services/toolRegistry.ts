@@ -448,12 +448,15 @@ async function writeTrackedFileContent(filePath: string, content: string, ctx?: 
   await fileSystem.writeFile(filePath, content, ctx?.contextId, ctx?.conversationId, ctx?.fileAccess);
   let trackedPath = filePath;
   let reviewPath: string | undefined;
+  let workspaceRoot: string | null | undefined;
   try {
     const resolved = await resolveDiffReviewPath(filePath, ctx?.contextId, ctx?.conversationId);
     trackedPath = resolved.resolvedPath;
     reviewPath = resolved.reviewPath;
+    workspaceRoot = resolved.workspaceRoot;
   } catch {
     reviewPath = undefined;
+    workspaceRoot = undefined;
   }
   const snapshotId = generateChangeId('snapshot');
   const diffId = generateChangeId('diff');
@@ -463,6 +466,7 @@ async function writeTrackedFileContent(filePath: string, content: string, ctx?: 
     id: diffId,
     path: trackedPath,
     ...(reviewPath ? { reviewPath } : {}),
+    ...(workspaceRoot ? { workspaceRoot } : {}),
     changeType: existed ? 'edited' : 'created',
     additions,
     deletions,

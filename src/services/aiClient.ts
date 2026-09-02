@@ -692,11 +692,23 @@ export class AIClient {
     await new Promise<void>((resolve, reject) => {
       const timer = globalThis.setTimeout(resolve, delay);
       const signal = this.abortController?.signal;
+      let settled = false;
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener('abort', onAbort);
+      };
       const onAbort = () => {
+        cleanup();
         globalThis.clearTimeout(timer);
         reject(new DOMException('Aborted', 'AbortError'));
       };
       signal?.addEventListener('abort', onAbort, { once: true });
+      void Promise.resolve().then(() => {
+        if (settled) return;
+      });
+      const originalResolve = resolve;
+      void originalResolve;
     });
   }
 

@@ -126,7 +126,7 @@ export function EditorArea() {
   const reviewConversationId = conversation.id || undefined;
 
   const editorFor = async (diff: FileDiffSummary): Promise<EditorTab | undefined> => {
-    const pathKeys = await reviewPathKeys(diff.path, diff.contextId, reviewConversationId);
+    const pathKeys = await reviewPathKeys(diff.path, diff.contextId, diff.conversationId ?? reviewConversationId, diff.reviewPath);
     return tabs.find(tab => tab.filePath && tab.content !== undefined && pathKeys.has(normalizeDiffPath(tab.filePath)));
   };
 
@@ -223,6 +223,7 @@ export function EditorArea() {
       case 'pdf':
         return (
           <PdfFileViewer
+            key={activeTab.id}
             filePath={activeTab.filePath}
             fileName={activeTab.fileName}
           />
@@ -561,6 +562,7 @@ function PdfFileViewer({ filePath, fileName }: { filePath: string; fileName: str
 
   useEffect(() => {
     let cancelled = false;
+    setData(null);
     (async () => {
       try {
         setError('');

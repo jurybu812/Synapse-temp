@@ -21,6 +21,7 @@ interface ReviewStateHunk extends ReviewStatePart {
 }
 
 export function hasPendingReviewParts(diff: ReviewStatePart & { hunks?: ReviewStateHunk[] }): boolean {
+  if (diff.status === 'accepted' || diff.status === 'rejected' || diff.status === 'superseded') return false;
   if (!diff.hunks || diff.hunks.length === 0) return diff.status === 'pending';
   return diff.hunks.some(hunk => {
     if (hunk.blocks && hunk.blocks.length > 0) {

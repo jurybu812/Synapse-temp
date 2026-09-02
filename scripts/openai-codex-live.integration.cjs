@@ -9,9 +9,28 @@ if (process.env.SYNAPSE_ALLOW_LIVE_PROVIDER_TESTS !== '1') {
   process.exit(0);
 }
 
-const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'synapse-openai-codex-live-'));
-process.env.SYNAPSE_DATA_DIR = path.join(tempRoot, 'data');
-app.setPath('home', path.join(tempRoot, 'home'));
+const seededStorageRoot = process.env.SYNAPSE_LIVE_STORAGE_ROOT?.trim();
+const tempRoot = seededStorageRoot
+  ? path.resolve(seededStorageRoot)
+  : fs.mkdtempSync(path.join(os.tmpdir(), 'synapse-openai-codex-live-'));
+const ownsTempRoot = !seededStorageRoot;
+if (seededStorageRoot) {
+  assert.equal(fs.statSync(tempRoot).isDirectory(), true, 'Seeded live storage root must be a directory');
+  const resolvedTempRoot = path.resolve(os.tmpdir()) + path.sep;
+  assert.equal(
+    tempRoot.startsWith(resolvedTempRoot),
+    true,
+    'Seeded live storage root must be an isolated directory under the system temp root',
+  );
+  const markerPath = path.join(tempRoot, '.synapse-live-test.json');
+  const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+  assert.equal(marker.purpose, 'synapse-provider-live-test', 'Seeded live storage root marker is invalid');
+}
+const disabledLegacyImportPath = path.join(tempRoot, '.disabled-legacy-openai-codex-import');
+assert.equal(fs.existsSync(disabledLegacyImportPath), false, 'Disabled legacy import sentinel path must not exist');
+process.env.SYNAPSE_OPENAI_CODEX_IMPORT_PATH = disabledLegacyImportPath;
+process.env.SYNAPSE_DATA_DIR = seededStorageRoot ? path.join(tempRoot, '.synapse') : path.join(tempRoot, 'data');
+app.setPath('home', seededStorageRoot ? tempRoot : path.join(tempRoot, 'home'));
 app.setPath('userData', path.join(tempRoot, 'user-data'));
 
 let databaseModule;
@@ -23,6 +42,11 @@ async function main() {
   codexModule = require('../dist-electron/electron/provider/openAICodex.js');
   const chatModule = require('../dist-electron/electron/provider/openAICodexChat.js');
   databaseModule.initDatabase();
+
+  const seededCredential = databaseModule.getDatabase()
+    .prepare("SELECT length(value) AS bytes FROM settings WHERE key = 'providerCredential:openai-codex'")
+    .get();
+  assert.ok(seededCredential?.bytes > 0, 'Seeded OpenAI Codex credential row is missing before Provider initialization');
 
   const status = await codexModule.openAICodexController.status();
   assert.equal(status.connected, true, 'OpenAI Codex encrypted credential was not imported');
@@ -84,7 +108,7 @@ main().catch(error => {
   try { databaseModule?.closeDatabase(); } catch {}
   try {
     const resolved = path.resolve(tempRoot);
-    if (resolved.startsWith(path.resolve(os.tmpdir()) + path.sep) && path.basename(resolved).startsWith('synapse-openai-codex-live-')) {
+    if (ownsTempRoot && resolved.startsWith(path.resolve(os.tmpdir()) + path.sep) && path.basename(resolved).startsWith('synapse-openai-codex-live-')) {
       fs.rmSync(resolved, { recursive: true, force: true });
     }
   } catch {}

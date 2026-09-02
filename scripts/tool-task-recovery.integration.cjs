@@ -47,6 +47,9 @@ function installTsRequireHook() {
     ['@/services/conversationPersistence', {
       AUTOSAVE_ID: 'autosave-current',
     }],
+    ['@platform/index', {
+      isElectron: false,
+    }],
   ]);
   Module._resolveFilename = function patchedResolve(request, parent, isMain, options) {
     if (stubs.has(request)) return request;

@@ -535,10 +535,6 @@ export class BpcScheduler {
       await this.discardCurrent(conversationId, '正式发布前模型/账号身份已变化，已丢弃候选');
       return null;
     }
-    if (currentStepCursor >= snapshot.targetReplaceStep) {
-      await this.discardCurrent(conversationId, '正式发布前历史已越过候选窗口');
-      return null;
-    }
     const candidate = snapshot.candidate;
     const loop = runtime.generationLoop;
     if (!candidate || !loop || !snapshot.inputHash) {

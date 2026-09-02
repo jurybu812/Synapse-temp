@@ -7,6 +7,7 @@ const { execFileSync, spawnSync } = require('node:child_process');
 
 const repoRoot = path.resolve(__dirname, '..');
 const auditScript = path.join(__dirname, 'audit-anonymous-submission.cjs');
+const exportScript = path.join(__dirname, 'export-anonymous-submission.cjs');
 
 function sha256Content(content) {
   return crypto.createHash('sha256').update(Buffer.from(content, 'utf8')).digest('hex');
@@ -60,7 +61,7 @@ function createManifest(root, entries) {
   writeText(root, 'SUBMISSION_MANIFEST.json', `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
-function createSubmission(root) {
+function createSubmission(root, extraFiles = []) {
   const files = new Map([
     ['LICENSE', 'MIT License\n\nPermission is hereby granted to use this project.\n'],
     ['README.md', '# Synapse\n\nAnonymous submission fixture.\n'],
@@ -86,6 +87,7 @@ function createSubmission(root) {
       },
     }, null, 2)}\n`],
   ]);
+  for (const [relativePath, content] of extraFiles) files.set(relativePath, content);
   for (const [relativePath, content] of files) writeText(root, relativePath, content);
   const entries = [...files.entries()].map(([relativePath, content]) => ({
     path: relativePath,
@@ -125,8 +127,17 @@ function expectSuccess(name, root) {
   console.log(`[pass] ${name}`);
 }
 
+function expectExporterWhitelist() {
+  const source = fs.readFileSync(exportScript, 'utf8');
+  assert.match(source, /const rootDirectories = new Set\(\[[^\]]*'shared'[^\]]*\]\);/);
+  assert.match(source, /Submission export requires a clean source worktree/);
+  console.log('[pass] exporter whitelist includes shared and keeps dirty guard');
+}
+
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'synapse-audit-anonymous-'));
 try {
+  expectExporterWhitelist();
+
   const emptyRepository = path.join(tempRoot, 'empty-repository');
   fs.mkdirSync(emptyRepository);
   initGit(emptyRepository);
@@ -158,6 +169,40 @@ try {
     'Git worktree must be clean before anonymous audit',
   ]);
 
+  const missingSharedTarget = path.join(tempRoot, 'missing-shared-target');
+  fs.mkdirSync(missingSharedTarget);
+  initGit(missingSharedTarget);
+  createSubmission(missingSharedTarget, [
+    ['electron/main.ts', "import { DESKTOP_BRIDGE_PROTOCOL_VERSION } from '../shared/desktopBridge';\nconsole.log(DESKTOP_BRIDGE_PROTOCOL_VERSION);\n"],
+  ]);
+  commit(missingSharedTarget);
+  expectFailure('missing shared reference target', missingSharedTarget, [
+    'Unresolved exported module reference: electron/main.ts -> ../shared/desktopBridge',
+  ]);
+
+  const forbiddenPathTarget = path.join(tempRoot, 'forbidden-path-target');
+  fs.mkdirSync(forbiddenPathTarget);
+  initGit(forbiddenPathTarget);
+  createSubmission(forbiddenPathTarget, [
+    ['.codex/config.toml', 'private = true\n'],
+    ['credentials/token.txt', 'placeholder\n'],
+    ['dist/app.js', 'console.log("generated");\n'],
+    ['node_modules/example/index.js', 'module.exports = {};\n'],
+    ['plans/Task.md', '# Private task notes\n'],
+    ['profile/state.json', '{}\n'],
+    ['release/build.txt', 'generated\n'],
+  ]);
+  commit(forbiddenPathTarget);
+  expectFailure('forbidden private or generated paths', forbiddenPathTarget, [
+    '.codex is forbidden',
+    'credentials is forbidden',
+    'dist is forbidden',
+    'node_modules is forbidden',
+    'plans is forbidden',
+    'profile is forbidden',
+    'release is forbidden',
+  ]);
+
   const extraRefTarget = path.join(tempRoot, 'extra-ref-target');
   fs.mkdirSync(extraRefTarget);
   initGit(extraRefTarget);
@@ -171,7 +216,11 @@ try {
   const qualifiedTarget = path.join(tempRoot, 'qualified-target');
   fs.mkdirSync(qualifiedTarget);
   initGit(qualifiedTarget);
-  createSubmission(qualifiedTarget);
+  createSubmission(qualifiedTarget, [
+    ['electron/main.ts', "import { DESKTOP_BRIDGE_PROTOCOL_VERSION } from '../shared/desktopBridge';\nconsole.log(DESKTOP_BRIDGE_PROTOCOL_VERSION);\n"],
+    ['shared/desktopBridge.ts', 'export const DESKTOP_BRIDGE_PROTOCOL_VERSION = 2;\n'],
+    ['src/platform/index.ts', "import { DESKTOP_BRIDGE_PROTOCOL_VERSION } from '../../shared/desktopBridge';\nexport const bridgeVersion = DESKTOP_BRIDGE_PROTOCOL_VERSION;\n"],
+  ]);
   commit(qualifiedTarget);
   expectSuccess('qualified target', qualifiedTarget);
 } finally {

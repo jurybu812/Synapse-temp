@@ -22,7 +22,11 @@ export interface ApprovalRequest {
   argsText: string;
   /** 发起方文案：'AI' 或 '子代理「角色」'。 */
   originLabel: string;
+  title?: string;
+  confirmLabel?: string;
+  queuedCount?: number;
   /** 审批所属对话，避免切换页面后误把 A 的操作当成 B 批准。 */
+  conversationId?: string;
   conversationLabel?: string;
   /** 可选的定制说明（如 enter_worktree 解释会建工作树目录+分支）。参数仍会同时展示。 */
   message?: string;
@@ -32,6 +36,7 @@ interface Props {
   request: ApprovalRequest | null;
   onApprove: () => void;
   onReject: () => void;
+  onStop?: () => void;
 }
 
 const LEVEL_META: Record<string, { label: string; cls: string }> = {
@@ -41,7 +46,7 @@ const LEVEL_META: Record<string, { label: string; cls: string }> = {
   dangerous: { label: '危险', cls: 'danger' },
 };
 
-export function ApprovalDialog({ request, onApprove, onReject }: Props) {
+export function ApprovalDialog({ request, onApprove, onReject, onStop }: Props) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const rejectButtonRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
@@ -95,6 +100,7 @@ export function ApprovalDialog({ request, onApprove, onReject }: Props) {
     : request.level === 'write'
       ? '仅允许此次写入'
       : '仅允许此次操作';
+  const confirmLabel = request.confirmLabel ?? approveLabel;
   const titleId = `approval-title-${request.id}`;
   const descriptionId = `approval-description-${request.id}`;
 
@@ -113,8 +119,9 @@ export function ApprovalDialog({ request, onApprove, onReject }: Props) {
       >
         <div className="approval-header">
           <ShieldAlert size={18} className="approval-icon" />
-          <span id={titleId} className="approval-title">{request.originLabel}请求执行工具</span>
+          <span id={titleId} className="approval-title">{request.title ?? `${request.originLabel}请求执行工具`}</span>
           <span className={`approval-badge ${lv.cls}`}>{lv.label}</span>
+          {request.queuedCount ? <span className="approval-queue">排队 {request.queuedCount} 个</span> : null}
         </div>
         <div className="approval-tool">{request.toolName}</div>
         <div id={descriptionId} className="approval-content">
@@ -130,8 +137,9 @@ export function ApprovalDialog({ request, onApprove, onReject }: Props) {
           </div>
         </div>
         <div className="approval-actions">
+          {onStop ? <button type="button" className="approval-btn danger" onClick={onStop}>停止任务</button> : null}
           <button ref={rejectButtonRef} type="button" className="approval-btn reject" onClick={onReject}>拒绝 (Esc)</button>
-          <button type="button" className="approval-btn approve" onClick={onApprove}>{approveLabel} (Ctrl+Enter)</button>
+          <button type="button" className="approval-btn approve" onClick={onApprove}>{confirmLabel} (Ctrl+Enter)</button>
         </div>
       </div>
     </div>,

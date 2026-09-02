@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const Database = require('better-sqlite3');
-const { app, ipcMain } = require('electron');
+const { app, ipcMain, shell } = require('electron');
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'synapse-windsurf-local-import-'));
 const appDataRoot = path.join(tempRoot, 'AppData', 'Roaming');
@@ -18,15 +18,25 @@ app.setPath('userData', path.join(tempRoot, 'user-data'));
 const handlers = new Map();
 let databaseModule;
 let providerModule;
+let credentialStoreModule;
+const openedAuthorizationUrls = [];
+const originalOpenExternal = shell.openExternal;
+shell.openExternal = async url => {
+  openedAuthorizationUrls.push(String(url));
+};
 
 ipcMain.handle = (channel, handler) => {
   handlers.set(channel, handler);
 };
 
 function invoke(channel, ...args) {
+  return invokeAs(7, channel, ...args);
+}
+
+function invokeAs(senderId, channel, ...args) {
   const handler = handlers.get(channel);
   if (!handler) throw new Error(`Missing IPC handler: ${channel}`);
-  return Promise.resolve(handler({ sender: { id: 7 } }, ...args));
+  return Promise.resolve(handler({ sender: { id: senderId } }, ...args));
 }
 
 function assertNoSecret(value, ...secrets) {
@@ -72,6 +82,7 @@ function writeStateDb(source, authStatus, selected = undefined) {
 async function main() {
   await app.whenReady();
   databaseModule = require('../dist-electron/electron/database.js');
+  credentialStoreModule = require('../dist-electron/electron/provider/credentialStore.js');
   providerModule = require('../dist-electron/electron/ipc/provider.js');
   databaseModule.initDatabase();
   providerModule.registerProviderHandlers();
@@ -155,6 +166,28 @@ async function main() {
   assert.ok(stored?.value);
   assert.equal(String(stored.value).includes(firstSecret), false);
 
+  credentialStoreModule.markProviderCredentialRejected('windsurf', 'fixture credential rejected');
+  const rejectedStatus = await invoke('provider:windsurfStatus');
+  assert.equal(rejectedStatus.state, 'error');
+  assert.equal(rejectedStatus.connected, false);
+  const waitingForComplete = await invoke('provider:windsurfLogin');
+  assert.equal(waitingForComplete.state, 'waiting');
+  assert.equal(waitingForComplete.connected, false);
+  assert.equal(waitingForComplete.error, null);
+  assert.match(waitingForComplete.transactionId, /^[A-Za-z0-9_-]{32,}$/);
+  await assert.rejects(
+    invoke('provider:windsurfComplete', waitingForComplete.transactionId, 'too-short'),
+    /Invalid Windsurf login token/,
+  );
+  const waitingForCancel = await invoke('provider:windsurfLogin');
+  assert.equal(waitingForCancel.state, 'waiting');
+  const cancelledLogin = await invoke('provider:windsurfCancel');
+  assert.equal(cancelledLogin.state, 'error');
+  assert.equal(cancelledLogin.error, 'fixture credential rejected');
+  assert.equal(openedAuthorizationUrls.length, 2);
+  credentialStoreModule.clearProviderCredentialRejection('windsurf');
+  assert.equal((await invoke('provider:windsurfStatus')).state, 'connected');
+
   const repeated = await invoke('provider:windsurfImportLocal');
   assert.equal(repeated.ok, true);
   assert.equal(repeated.unchanged, true);
@@ -173,8 +206,46 @@ async function main() {
   assert.equal(multiple.ok, false);
   assert.equal(multiple.error.code, 'multiple_accounts');
   assert.equal(multiple.error.candidates.length, 2);
+  assert.equal(multiple.error.candidates.every(candidate => /^[a-f0-9]{64}$/.test(candidate.candidateFingerprint)), true);
+  const alphaCandidate = multiple.error.candidates.find(candidate => candidate.accountLabel === 'alpha@example.test');
+  const charlieCandidate = multiple.error.candidates.find(candidate => candidate.accountLabel === 'charlie@example.test');
+  assert.ok(alphaCandidate);
+  assert.ok(charlieCandidate);
+  assert.notEqual(alphaCandidate.candidateFingerprint, charlieCandidate.candidateFingerprint);
+  const selectedExisting = await invoke('provider:windsurfImportLocal', {
+    candidateFingerprint: alphaCandidate.candidateFingerprint,
+  });
+  assert.equal(selectedExisting.ok, true);
+  assert.equal(selectedExisting.unchanged, true);
+  const selectedDifferentChallenge = await invoke('provider:windsurfImportLocal', {
+    candidateFingerprint: charlieCandidate.candidateFingerprint,
+  });
+  assert.equal(selectedDifferentChallenge.ok, false);
+  assert.equal(selectedDifferentChallenge.error.code, 'replace_required');
+  const selectedDifferent = await invoke('provider:windsurfImportLocal', {
+    confirmationToken: selectedDifferentChallenge.error.confirmationToken,
+    candidateFingerprint: charlieCandidate.candidateFingerprint,
+  });
+  assert.equal(selectedDifferent.ok, true);
+  assert.equal(selectedDifferent.replaced, true);
+  assert.equal(selectedDifferent.accountLabel, 'charlie@example.test');
+  const selectedDifferentStatus = await invoke('provider:credentialStatus', 'windsurf');
+  const invalidCandidate = await invoke('provider:windsurfImportLocal', {
+    candidateFingerprint: '0'.repeat(64),
+  });
+  assert.equal(invalidCandidate.ok, false);
+  assert.equal(invalidCandidate.error.code, 'candidate_selection_invalid');
+  assert.equal(invalidCandidate.error.candidates.length, 2);
+  const staleCandidateFingerprint = charlieCandidate.candidateFingerprint;
   assertNoSecret(multiple, firstSecret, extraSecret);
   resetSource('windsurf');
+  const staleCandidate = await invoke('provider:windsurfImportLocal', {
+    candidateFingerprint: staleCandidateFingerprint,
+  });
+  assert.equal(staleCandidate.ok, false);
+  assert.equal(staleCandidate.error.code, 'candidate_selection_invalid');
+  assert.equal(staleCandidate.error.candidates.length, 1);
+  assert.equal(staleCandidate.error.candidates[0].accountLabel, 'alpha@example.test');
 
   writeStateDb('devin', {
     sessionToken: secondSecret,
@@ -185,19 +256,52 @@ async function main() {
   assert.equal(replaceRequired.ok, false);
   assert.equal(replaceRequired.error.code, 'replace_required');
   assert.match(replaceRequired.error.confirmationToken, /^[A-Za-z0-9_-]{32,}$/);
+  assert.match(replaceRequired.error.candidates[0].candidateFingerprint, /^[a-f0-9]{64}$/);
+  const bravoCandidateFingerprint = replaceRequired.error.candidates[0].candidateFingerprint;
   assertNoSecret(replaceRequired, firstSecret, secondSecret);
-  const stillFirst = await invoke('provider:credentialStatus', 'windsurf');
-  assert.equal(stillFirst.accountFingerprint, configured.accountFingerprint);
+  const stillCurrent = await invoke('provider:credentialStatus', 'windsurf');
+  assert.equal(stillCurrent.accountFingerprint, selectedDifferentStatus.accountFingerprint);
 
   const bypassAttempt = await invoke('provider:windsurfImportLocal', { replace: true });
   assert.equal(bypassAttempt.ok, false);
   assert.equal(bypassAttempt.error.code, 'replace_required');
-  const wrongConfirmation = await invoke('provider:windsurfImportLocal', { confirmationToken: 'wrong-token' });
+  const wrongConfirmation = await invoke('provider:windsurfImportLocal', {
+    confirmationToken: 'wrong-token',
+    candidateFingerprint: bravoCandidateFingerprint,
+  });
   assert.equal(wrongConfirmation.ok, false);
   assert.equal(wrongConfirmation.error.code, 'replace_confirmation_invalid');
+  const tokenOnlyChallenge = await invoke('provider:windsurfImportLocal');
+  const tokenOnlyAttempt = await invoke('provider:windsurfImportLocal', {
+    confirmationToken: tokenOnlyChallenge.error.confirmationToken,
+  });
+  assert.equal(tokenOnlyAttempt.ok, false);
+  assert.equal(tokenOnlyAttempt.error.code, 'replace_confirmation_invalid');
+  const requesterChallenge = await invoke('provider:windsurfImportLocal');
+  const wrongRequester = await invokeAs(8, 'provider:windsurfImportLocal', {
+    confirmationToken: requesterChallenge.error.confirmationToken,
+    candidateFingerprint: bravoCandidateFingerprint,
+  });
+  assert.equal(wrongRequester.ok, false);
+  assert.equal(wrongRequester.error.code, 'replace_confirmation_invalid');
+  const generationChallenge = await invoke('provider:windsurfImportLocal');
+  credentialStoreModule.setProviderCredential('windsurf', 'browser-oauth', {
+    kind: 'local_client_import',
+    apiKey: firstSecret,
+    createdAt: new Date().toISOString(),
+    apiServerUrl: 'https://server.codeium.com',
+    accountName: 'alpha@example.test',
+  }, firstSecret);
+  const changedGeneration = await invoke('provider:windsurfImportLocal', {
+    confirmationToken: generationChallenge.error.confirmationToken,
+    candidateFingerprint: bravoCandidateFingerprint,
+  });
+  assert.equal(changedGeneration.ok, false);
+  assert.equal(changedGeneration.error.code, 'replace_confirmation_invalid');
   const freshChallenge = await invoke('provider:windsurfImportLocal');
   const replaced = await invoke('provider:windsurfImportLocal', {
     confirmationToken: freshChallenge.error.confirmationToken,
+    candidateFingerprint: bravoCandidateFingerprint,
   });
   assert.equal(replaced.ok, true);
   assert.equal(replaced.replaced, true);
@@ -218,12 +322,16 @@ async function main() {
 
   const preloadSource = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.ts'), 'utf8');
   assert.match(preloadSource, /windsurfImportLocal/);
+  assert.match(preloadSource, /candidateFingerprint/);
   assert.doesNotMatch(preloadSource, /windsurfImportLocal:[\s\S]{0,180}(apiKey|accessToken|sessionToken|jwt)/i);
 
   const settingsSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'settings', 'SettingsPanel.tsx'), 'utf8');
   assert.match(settingsSource, /replace_required/);
   assert.match(settingsSource, /confirmAction/);
   assert.match(settingsSource, /error\.confirmationToken/);
+  assert.match(settingsSource, /windsurf-import-candidates/);
+  assert.match(settingsSource, /candidate\.accountLabel/);
+  assert.match(settingsSource, /candidate\.source/);
   assert.match(settingsSource, /已取消本机导入/);
 
   console.log('Windsurf local import integration: all assertions passed');
@@ -236,6 +344,7 @@ main()
     console.error(error);
   })
   .finally(() => {
+    shell.openExternal = originalOpenExternal;
     try { providerModule?.shutdownProviderRuntime(); } catch {}
     try { databaseModule?.closeDatabase(); } catch {}
     try { fs.rmSync(tempRoot, { recursive: true, force: true }); } catch {}

@@ -3,12 +3,14 @@
  * Electron 模式下使用真实的 IPC 桥接
  * Web 模式下使用 Mock 实现
  */
+import { DESKTOP_BRIDGE_PROTOCOL_VERSION } from '../../shared/desktopBridge';
 
 export interface PlatformInfo {
   isElectron: boolean;
   platform: string;
   version: string;
   userDataPath: string;
+  bridgeProtocolVersion?: number;
 }
 
 export interface WallpaperAsset {
@@ -22,6 +24,26 @@ export interface WallpaperAsset {
   width?: number;
   height?: number;
   addedAt: number;
+}
+
+export type SensitiveApprovalLevel = 'auto' | 'read' | 'write' | 'command' | 'dangerous';
+
+export interface SensitiveApprovalRequestPayload {
+  requestId: string;
+  title: string;
+  message: string;
+  details: string[];
+  confirmLabel: string;
+  toolName: string;
+  level: SensitiveApprovalLevel;
+  conversationId?: string;
+  ownerId?: string;
+  runId?: string;
+  callId?: string;
+}
+
+export interface SensitiveApprovalCancelPayload {
+  requestId: string;
 }
 
 // ===== git worktree (M2-4) =====
@@ -204,6 +226,7 @@ export interface WindsurfStatus {
 }
 
 export interface WindsurfLocalImportCandidate {
+  candidateFingerprint: string;
   source: string;
   accountLabel: string | null;
   apiServerUrl: string | null;
@@ -221,6 +244,7 @@ export interface WindsurfLocalImportResult {
     code:
       | 'not_found'
       | 'multiple_accounts'
+      | 'candidate_selection_invalid'
       | 'database_locked'
       | 'database_corrupt'
       | 'invalid_credential'
@@ -295,11 +319,18 @@ export interface SynapseAPI {
     info: () => Promise<PlatformInfo>;
     openExternal: (url: string) => Promise<boolean>;
     isElectron: boolean;
+    bridgeProtocolVersion: number;
+  };
+  approval?: {
+    onRequest: (callback: (payload: SensitiveApprovalRequestPayload) => void) => () => void;
+    onCancel: (callback: (payload: SensitiveApprovalCancelPayload) => void) => () => void;
+    respond: (requestId: string, approved: boolean) => void;
   };
   window: {
     minimize: () => void;
     maximize: () => void;
     close: () => void;
+    reload: () => void;
     isMaximized?: () => Promise<boolean>;
       onCloseRequested?: (callback: (payload: { requestId: string; action: 'close' | 'reload' | 'reloadIgnoringCache' }) => void) => () => void;
       setDirty?: (dirty: boolean) => void;
@@ -314,7 +345,7 @@ export interface SynapseAPI {
     exists: (filePath: string, access?: AgentFileAccessContext) => Promise<boolean>;
     read: (filePath: string, access?: AgentFileAccessContext) => Promise<string>;
     readBinary: (filePath: string, access?: AgentFileAccessContext) => Promise<number[] | ArrayBuffer | Uint8Array>;
-    convertOffice?: (filePath: string, access?: AgentFileAccessContext) => Promise<{ success?: boolean; error?: boolean; message?: string; outputPath?: string; format?: 'pdf'; tempDir?: string }>;
+    convertOffice?: (filePath: string, access?: AgentFileAccessContext) => Promise<{ success?: boolean; error?: boolean; message?: string; outputPath?: string; format?: 'pdf'; tempDir?: string; cacheHit?: boolean }>;
     cleanupTemp?: (targetPath: string) => Promise<{ success?: boolean; error?: boolean; message?: string }>;
     write: (
       filePath: string,
@@ -326,7 +357,11 @@ export interface SynapseAPI {
     search: (dir: string, pattern: string, access?: AgentFileAccessContext) => Promise<any[]>;
     grep: (dir: string, query: string, opts: any, access?: AgentFileAccessContext) => Promise<any[]>;
     rename: (oldPath: string, newPath: string, access?: AgentFileAccessContext) => Promise<void>;
-    delete: (path: string, access?: AgentFileAccessContext) => Promise<void>;
+    delete: (
+      path: string,
+      access?: AgentFileAccessContext,
+      options?: { expectedContent?: string },
+    ) => Promise<void | { success?: boolean; error?: boolean; conflict?: boolean; message?: string; currentContent?: string | null }>;
     mkdir: (path: string, access?: AgentFileAccessContext) => Promise<void>;
     classifyAccess: (filePath: string, workspaceRoot: string | null) => Promise<AgentFileAccessClassification>;
     showInFolder: (targetPath: string) => Promise<{ success?: boolean; error?: boolean; message?: string; path?: string }>;
@@ -339,9 +374,10 @@ export interface SynapseAPI {
   };
   workspace: {
     open: () => Promise<{ id: string; name: string; path: string } | null>;
+    selectDirectory: () => Promise<string | null>;
     recent: (limit?: number) => Promise<any[]>;
-    switch: (id: string) => Promise<any | null>;
-    delete: (id: string) => Promise<boolean>;
+    switch: (input: string | { id: string; name: string; path: string }) => Promise<any | null>;
+    delete: (input: string | { id: string; path?: string }) => Promise<boolean>;
     tree: (path: string, maxDepth?: number, access?: AgentFileAccessContext) => Promise<any>;
   };
   mcp: {
@@ -428,7 +464,7 @@ export interface SynapseAPI {
     windsurfStatus: () => Promise<WindsurfStatus>;
     windsurfLogin: () => Promise<WindsurfStatus>;
     windsurfComplete: (transactionId: string, token: string) => Promise<WindsurfStatus>;
-    windsurfImportLocal: (options?: { confirmationToken?: string }) => Promise<WindsurfLocalImportResult>;
+    windsurfImportLocal: (options?: { confirmationToken?: string; candidateFingerprint?: string }) => Promise<WindsurfLocalImportResult>;
     windsurfCancel: () => Promise<WindsurfStatus>;
     windsurfLogout: () => Promise<WindsurfStatus>;
     windsurfModels: (force?: boolean) => Promise<ProviderChatStartResult>;
@@ -506,8 +542,14 @@ declare global {
   }
 }
 
-// 检测是否在 Electron 环境
-export const isElectron = !!(window as any).synapse?.platform?.isElectron;
+const electronUserAgent = /\bElectron\//.test(navigator.userAgent);
+const bridgeProtocolMatches = window.synapse?.platform?.isElectron === true
+  && window.synapse.platform.bridgeProtocolVersion === DESKTOP_BRIDGE_PROTOCOL_VERSION;
+
+export const desktopBridgeState: 'ready' | 'degraded' | 'web' = electronUserAgent
+  ? bridgeProtocolMatches ? 'ready' : 'degraded'
+  : 'web';
+export const isElectron = desktopBridgeState === 'ready';
 
 // 获取平台 API（Electron 真实 API 或 Web Mock）
 export function getPlatform(): SynapseAPI {
@@ -534,11 +576,13 @@ function getWebMock(): SynapseAPI {
         return true;
       },
       isElectron: false,
+      bridgeProtocolVersion: 0,
     },
     window: {
       minimize: () => console.log('[Web Mock] window:minimize'),
       maximize: () => console.log('[Web Mock] window:maximize'),
       close: () => console.log('[Web Mock] window:close'),
+      reload: () => window.location.reload(),
       isMaximized: async () => false,
     },
     file: {
@@ -573,6 +617,7 @@ function getWebMock(): SynapseAPI {
     },
     workspace: {
       open: async () => null,
+      selectDirectory: async () => null,
       recent: async () => [],
       switch: async () => null,
       delete: async () => false,
@@ -1582,4 +1627,16 @@ async function webAttachmentRelease(sha256: string): Promise<AttachmentRefCountR
 }
 
 // 导出单例
+export function requestWindowReload(): void {
+  if (isElectron && window.synapse?.window.reload) {
+    window.synapse.window.reload();
+    return;
+  }
+  if (desktopBridgeState === 'web') {
+    window.location.reload();
+    return;
+  }
+  console.warn('[Synapse] Refused unsafe renderer reload because the Electron bridge is degraded.');
+}
+
 export const platform = getPlatform();

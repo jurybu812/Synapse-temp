@@ -42,7 +42,7 @@ try {
     { selectBpcUiState },
     { platform },
     { clampToBatch },
-    { readRecordAfterReadyPublication },
+    { applyReadyRecordToActiveRequest, readRecordAfterReadyPublication },
     { setProviderCredentialStatus },
     { setAvailableModels, setCurrentModel, setSystemModel },
   ] = await Promise.all([
@@ -288,6 +288,30 @@ try {
   assert.match(projectedRecordE.contentMd, /prepared by loop-E/);
   assert.equal(ui('E').state, 'idle', 'ready candidate must publish before current request projection');
 
+  const activeRequestAfterReady = applyReadyRecordToActiveRequest([
+    { role: 'system', content: 'stable system prompt' },
+    { role: 'user', content: 'old round' },
+    { role: 'assistant', content: 'old answer' },
+    { role: 'user', content: 'kept round' },
+    { role: 'assistant', content: 'call tool', tool_calls: [{ id: 'call-1' }] },
+    { role: 'tool', content: 'tool result', tool_call_id: 'call-1' },
+    { role: 'assistant', content: 'continue' },
+    { role: 'user', content: 'current round' },
+  ], 'published record');
+  assert.deepEqual(
+    activeRequestAfterReady.map(message => [message.role, message.content]),
+    [
+      ['system', 'stable system prompt'],
+      ['system', '[对话历史摘要]\n\npublished record'],
+      ['user', 'kept round'],
+      ['assistant', 'call tool'],
+      ['tool', 'tool result'],
+      ['assistant', 'continue'],
+      ['user', 'current round'],
+    ],
+    'ready BPC must replace the old prefix while preserving the two newest raw rounds and tool results',
+  );
+
   const lateScheduler = createScheduler();
   const lateLoop = createLoop('loop-F', 0, true);
   lateScheduler.evaluateWater(
@@ -297,8 +321,12 @@ try {
   await waitFor(() => ui('F').state === 'ready', 'F candidate ready before late publish');
   stepByConversation.set('F', 1_000);
   lateLoop.isRunning = false;
-  assert.equal(await lateScheduler.publishReadyIfIdle('F'), false, 'late candidate must not publish outside its frozen window');
-  assert.equal(await platform.conversation.getRecord('F'), null);
+  assert.equal(
+    await lateScheduler.publishReadyIfIdle('F'),
+    true,
+    'an append-only raw tail must not invalidate a prepared prefix candidate',
+  );
+  assert.match((await platform.conversation.getRecord('F')).contentMd, /prepared by loop-F/);
   assert.equal(ui('F').state, 'idle');
 
   configureIdentity(identityA);

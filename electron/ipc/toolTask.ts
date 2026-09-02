@@ -1,4 +1,6 @@
 import { ipcMain } from 'electron';
+import * as fs from 'fs';
+import { resolveFilePath } from '../fileAccess';
 import { TaskBroker } from '../toolTasks/TaskBroker';
 import { CommandTaskExecutor } from '../toolTasks/executors/command';
 import { McpTaskExecutor } from '../toolTasks/executors/mcp';
@@ -42,15 +44,24 @@ export function registerToolTaskHandlers(): void {
             const input = request.input && typeof request.input === 'object' ? request.input as Record<string, unknown> : {};
             const command = typeof input.command === 'string' ? input.command.trim() : '';
             if (!command) throw new Error('command 不能为空');
+            const requestedCwd = typeof input.cwd === 'string' ? input.cwd.trim() : '';
+            const effectiveCwd = requestedCwd ? resolveFilePath(requestedCwd) : process.cwd();
+            if (requestedCwd && !fs.existsSync(effectiveCwd)) throw new Error(`工作目录不存在: ${effectiveCwd}`);
             const approved = await confirmSensitiveOperationInMainWindow(event.sender, {
                 title: '确认运行系统命令',
                 message: '系统命令可能读取、修改或删除工作区外的数据。确认后只会启动下列这一条命令。',
                 details: [
                     `命令：${command}`,
-                    `工作目录：${typeof input.cwd === 'string' && input.cwd.trim() ? input.cwd.trim() : process.cwd()}`,
+                    `工作目录：${effectiveCwd}`,
                 ],
                 confirmLabel: '运行命令',
+                toolName: 'run_command',
+                level: 'command',
                 approvalId: request.taskId ? `tool-task:${request.taskId}` : undefined,
+                conversationId: request.identity.conversationId,
+                ownerId: request.identity.ownerId,
+                runId: request.identity.runId,
+                callId: request.identity.callId,
             });
             if (!approved) throw new Error('用户取消了系统命令');
         } else if (!existingTask && request.kind === 'mcp') {
@@ -66,7 +77,13 @@ export function registerToolTaskHandlers(): void {
                     `声明级别：${typeof input.approvalLevel === 'string' ? input.approvalLevel : '未知'}`,
                 ],
                 confirmLabel: '允许本次调用',
+                toolName: `mcp:${server}/${tool}`,
+                level: 'dangerous',
                 approvalId: request.taskId ? `tool-task:${request.taskId}` : undefined,
+                conversationId: request.identity.conversationId,
+                ownerId: request.identity.ownerId,
+                runId: request.identity.runId,
+                callId: request.identity.callId,
             });
             if (!approved) throw new Error('用户取消了外部 MCP 工具');
         }

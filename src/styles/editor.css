@@ -343,6 +343,15 @@
   color: var(--syn-text-muted);
 }
 
+.recent-item-path {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--syn-text-muted);
+}
+
 .recent-item-delete {
   opacity: 0;
   background: none;
@@ -353,8 +362,15 @@
   transition: opacity 150ms;
 }
 
-.welcome-recent-item:hover .recent-item-delete {
+.welcome-recent-item:hover .recent-item-delete,
+.welcome-recent-item:focus-within .recent-item-delete,
+.recent-item-delete:focus-visible {
   opacity: 1;
+}
+
+.recent-item-delete:focus-visible {
+  outline: 2px solid var(--syn-border-focused, var(--syn-primary));
+  outline-offset: 1px;
 }
 
 .recent-item-delete:hover {

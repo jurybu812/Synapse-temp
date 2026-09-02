@@ -29,6 +29,11 @@ export class FileWriteConflictError extends Error {
 // 处理（短路、零重定向）——保证现状/无上下文调用路径行为不变。
 
 import { selectWorktreeEntry } from '@/store/slices/worktreeSession';
+import {
+  clearExecutionWorkspaceSnapshot,
+  getExecutionWorkspaceSnapshot,
+  setExecutionWorkspaceSnapshot,
+} from './executionWorkspaceSnapshot';
 
 /** 路径是否为绝对路径（POSIX `/`、Windows 盘符 `X:\`、UNC `\\`）。渲染端无 node path，自己判。 */
 function isAbsolutePath(p: string): boolean {
@@ -57,6 +62,10 @@ function stripTrailingSep(p: string): string {
  */
 const DEMO_WORKSPACE_PATH = '/workspace';
 
+function workspacePathKey(workspacePath: string): string {
+  return stripTrailingSep(workspacePath).replace(/\\/g, '/').toLowerCase();
+}
+
 /**
  * 取某执行上下文当前生效的「活动根」信息。
  * 用动态 import 读 store，避免 fileSystem 单例在模块加载期与 store 形成初始化顺序耦合
@@ -68,11 +77,13 @@ const DEMO_WORKSPACE_PATH = '/workspace';
  * - repoRoot：进入该 worktree 时锚定的 git 仓根（绝对路径前缀重写以此为基准，不随工作区切换漂移）。
  * - currentPath：实时主工作区路径（仅在无锚定 repoRoot 时回退作前缀基准）。
  */
-export async function getActiveRoots(contextId?: string, conversationId?: string): Promise<{
+type ActiveRoots = {
   activeWorktreePath: string | null;
   repoRoot: string | null;
   currentPath: string | null;
-}> {
+};
+
+async function getLiveActiveRoots(contextId?: string, conversationId?: string): Promise<ActiveRoots> {
   try {
     const { store } = await import('@/store');
     const state = store.getState() as any;
@@ -90,6 +101,31 @@ export async function getActiveRoots(contextId?: string, conversationId?: string
     // store 不可用（极端初始化时序）时安全降级为「无重定向」，保持现状行为。
     return { activeWorktreePath: null, repoRoot: null, currentPath: null };
   }
+}
+
+export async function captureExecutionWorkspaceSnapshot(
+  contextId: string,
+  runId: string,
+  conversationId?: string,
+): Promise<void> {
+  const roots = await getLiveActiveRoots(contextId, conversationId);
+  setExecutionWorkspaceSnapshot(contextId, { runId, ...roots });
+}
+
+export function releaseExecutionWorkspaceSnapshot(contextId: string, runId: string): void {
+  clearExecutionWorkspaceSnapshot(contextId, runId);
+}
+
+export async function getActiveRoots(contextId?: string, conversationId?: string): Promise<ActiveRoots> {
+  const snapshot = getExecutionWorkspaceSnapshot(contextId);
+  if (snapshot) {
+    return {
+      activeWorktreePath: snapshot.activeWorktreePath,
+      repoRoot: snapshot.repoRoot,
+      currentPath: snapshot.currentPath,
+    };
+  }
+  return getLiveActiveRoots(contextId, conversationId);
 }
 
 /**
@@ -262,6 +298,8 @@ class FileSystemService {
   private currentWorkspace: string = 'default';
   private workspaceTrees = new Map<string, FileNode>();
   private listeners: Set<() => void> = new Set();
+  private workspaceGeneration = 0;
+  private workspaceIntentGeneration = 0;
 
   constructor() {
     this.fileTree = JSON.parse(JSON.stringify(DEMO_FILE_TREE));
@@ -275,8 +313,12 @@ class FileSystemService {
     if (saved) {
       try { this.workspaces = JSON.parse(saved); } catch {}
     }
-    if (this.workspaces.length === 0) {
+    if (this.workspaces.length === 0 && !isElectron) {
       this.workspaces = [{ id: 'default', name: '示例工作区', path: '/workspace', lastOpened: Date.now() }];
+    } else if (this.workspaces.length === 0) {
+      this.currentWorkspace = '';
+      this.fileTree = { name: '未加载工作区', path: '', type: 'directory', children: [] };
+      this.workspaceTrees.clear();
     }
     for (const ws of this.workspaces) {
       if (!this.workspaceTrees.has(ws.id)) {
@@ -296,7 +338,8 @@ class FileSystemService {
   private saveWorkspaces() { localStorage.setItem('synapse_workspaces', JSON.stringify(this.workspaces)); }
   private saveCurrentTree() { this.workspaceTrees.set(this.currentWorkspace, this.fileTree); }
   private getCurrentWorkspacePath(): string {
-    return this.workspaces.find(w => w.id === this.currentWorkspace)?.path || this.fileTree.path || '/workspace';
+    const currentPath = this.workspaces.find(w => w.id === this.currentWorkspace)?.path || this.fileTree.path;
+    return currentPath || (isElectron ? '' : DEMO_WORKSPACE_PATH);
   }
 
   // ==========================================
@@ -305,13 +348,92 @@ class FileSystemService {
 
   getWorkspaces(): Workspace[] { return this.workspaces; }
 
+  registerRecentWorkspaces(recentWorkspaces: Workspace[]): void {
+    let changed = false;
+
+    for (const incoming of recentWorkspaces) {
+      const incomingPathKey = workspacePathKey(incoming.path);
+      const existing = this.workspaces.find(workspace => (
+        workspace.id === incoming.id || workspacePathKey(workspace.path) === incomingPathKey
+      ));
+
+      if (existing) {
+        const previousId = existing.id;
+        const previousTree = this.workspaceTrees.get(previousId);
+        const nextLastOpened = Number.isFinite(incoming.lastOpened) ? incoming.lastOpened : existing.lastOpened;
+        if (
+          existing.id !== incoming.id
+          || existing.name !== incoming.name
+          || existing.path !== incoming.path
+          || existing.lastOpened !== nextLastOpened
+        ) {
+          existing.id = incoming.id;
+          existing.name = incoming.name;
+          existing.path = incoming.path;
+          existing.lastOpened = nextLastOpened;
+          if (previousId !== incoming.id) {
+            this.workspaceTrees.delete(previousId);
+            if (this.currentWorkspace === previousId) this.currentWorkspace = incoming.id;
+          }
+          if (previousTree) this.workspaceTrees.set(incoming.id, previousTree);
+          changed = true;
+        }
+        continue;
+      }
+
+      this.workspaces.push({ ...incoming });
+      this.workspaceTrees.set(incoming.id, {
+        name: incoming.name,
+        path: incoming.path,
+        type: 'directory',
+        children: [],
+      });
+      changed = true;
+    }
+
+    const deduped = this.workspaces
+      .slice()
+      .sort((left, right) => right.lastOpened - left.lastOpened)
+      .filter((workspace, index, all) => (
+        all.findIndex(candidate => workspacePathKey(candidate.path) === workspacePathKey(workspace.path)) === index
+      ));
+    if (deduped.length !== this.workspaces.length || deduped.some((workspace, index) => workspace !== this.workspaces[index])) {
+      this.workspaces = deduped;
+      changed = true;
+    }
+
+    if (!changed) return;
+    this.saveWorkspaces();
+    this.notify();
+  }
+
   getCurrentWorkspace(): string { return this.currentWorkspace; }
+
+  beginWorkspaceTransition(): number {
+    this.workspaceGeneration += 1;
+    this.workspaceIntentGeneration += 1;
+    return this.workspaceGeneration;
+  }
+
+  isWorkspaceTransitionCurrent(generation: number): boolean {
+    return generation === this.workspaceGeneration;
+  }
+
+  beginWorkspaceIntent(): number {
+    this.workspaceIntentGeneration += 1;
+    return this.workspaceIntentGeneration;
+  }
+
+  isWorkspaceIntentCurrent(generation: number): boolean {
+    return generation === this.workspaceIntentGeneration;
+  }
 
   hasNode(path: string): boolean {
     return !!this.findNode(path);
   }
 
   clearLoadedWorkspace(): void {
+    this.beginWorkspaceTransition();
     this.saveCurrentTree();
     this.currentWorkspace = '';
     this.fileTree = { name: '未加载工作区', path: '', type: 'directory', children: [] };
@@ -319,6 +441,7 @@ class FileSystemService {
   }
 
   createWorkspace(name: string): Workspace {
+    this.beginWorkspaceTransition();
     this.saveCurrentTree();
     const ws: Workspace = {
       id: `ws_${Date.now()}`,
@@ -344,14 +467,27 @@ class FileSystemService {
   }
 
   openExternalWorkspace(ws: Workspace): void {
+    this.beginWorkspaceTransition();
     this.saveCurrentTree();
-    const existing = this.workspaces.find(w => w.id === ws.id || w.path === ws.path);
+    const incomingPathKey = workspacePathKey(ws.path);
+    const existing = this.workspaces.find(w => w.id === ws.id || workspacePathKey(w.path) === incomingPathKey);
     if (existing) {
+      const previousId = existing.id;
+      const previousTree = this.workspaceTrees.get(previousId);
+      const pathChanged = workspacePathKey(existing.path) !== incomingPathKey;
+      existing.id = ws.id;
       existing.name = ws.name;
+      existing.path = ws.path;
       existing.lastOpened = Date.now();
       this.currentWorkspace = existing.id;
-      this.fileTree = this.workspaceTrees.get(existing.id) ?? { name: ws.name, path: ws.path, type: 'directory', children: [] };
+      if (previousId !== existing.id) this.workspaceTrees.delete(previousId);
+      this.fileTree = pathChanged
+        ? { name: ws.name, path: ws.path, type: 'directory', children: [] }
+        : previousTree ?? { name: ws.name, path: ws.path, type: 'directory', children: [] };
       this.workspaceTrees.set(existing.id, this.fileTree);
+      this.workspaces = this.workspaces.filter(workspace => (
+        workspace === existing || workspacePathKey(workspace.path) !== incomingPathKey
+      ));
     } else {
       this.workspaces.unshift({ ...ws, lastOpened: Date.now() });
       this.currentWorkspace = ws.id;
@@ -365,6 +501,7 @@ class FileSystemService {
   switchWorkspace(id: string) {
     const ws = this.workspaces.find(w => w.id === id);
     if (ws) {
+      this.beginWorkspaceTransition();
       this.saveCurrentTree();
       ws.lastOpened = Date.now();
       this.currentWorkspace = id;
@@ -379,6 +516,13 @@ class FileSystemService {
     this.workspaces = this.workspaces.filter(w => w.id !== id);
     this.workspaceTrees.delete(id);
     if (this.currentWorkspace === id) {
+      if (this.workspaces.length === 0 && isElectron) {
+        this.currentWorkspace = '';
+        this.fileTree = { name: '未加载工作区', path: '', type: 'directory', children: [] };
+        this.saveWorkspaces();
+        this.notify();
+        return;
+      }
       const next = this.workspaces[0] ?? { id: 'default', name: '示例工作区', path: '/workspace', lastOpened: Date.now() };
       if (this.workspaces.length === 0) this.workspaces = [next];
       this.currentWorkspace = next.id;
@@ -449,13 +593,13 @@ class FileSystemService {
     throw new Error(`Web 模式下请先导入真实文件: ${filePath}`);
   }
 
-  async convertOfficeToPdf(filePath: string): Promise<{ outputPath: string; tempDir?: string }> {
+  async convertOfficeToPdf(filePath: string): Promise<{ outputPath: string; tempDir?: string; cacheHit?: boolean }> {
     if (isElectron && window.synapse?.file.convertOffice) {
       const result = await window.synapse.file.convertOffice(filePath);
       if (result?.error || !result?.outputPath) {
         throw new Error(result?.message || 'Office 转换失败');
       }
-      return { outputPath: result.outputPath, tempDir: result.tempDir };
+      return { outputPath: result.outputPath, tempDir: result.tempDir, cacheHit: result.cacheHit };
     }
     throw new Error('Web 模式暂无本地 Office 转换能力，请在 Electron 模式下打开。');
   }
@@ -553,12 +697,30 @@ class FileSystemService {
     return dirPath;
   }
 
-  async deleteFile(filePath: string, contextId?: string, conversationId?: string, access?: AgentFileAccessContext): Promise<void> {
+  async deleteFile(
+    filePath: string,
+    contextId?: string,
+    conversationId?: string,
+    access?: AgentFileAccessContext,
+    options?: { expectedContent?: string },
+  ): Promise<void> {
     if (isElectron && window.synapse) {
       // 删除与读写使用同一解析口径：活动 worktree 优先，否则锚到产生改动的对话工作区。
-      await window.synapse.file.delete(await resolveWorkspacePath(filePath, contextId, conversationId), access);
+      const result = await window.synapse.file.delete(await resolveWorkspacePath(filePath, contextId, conversationId), access, options);
+      if (result && typeof result === 'object' && 'conflict' in result && result.conflict) {
+        throw new FileWriteConflictError(result.message || '文件已在删除前被其它操作修改', result.currentContent ?? null);
+      }
+      if (result && typeof result === 'object' && 'error' in result && result.error) {
+        throw new Error(result.message || '文件删除失败');
+      }
       this.notify();
       return;
+    }
+    if (options && Object.prototype.hasOwnProperty.call(options, 'expectedContent')) {
+      const currentContent = this.memoryFiles.has(filePath) ? (this.memoryFiles.get(filePath) ?? '') : null;
+      if (currentContent !== options.expectedContent) {
+        throw new FileWriteConflictError('文件已在删除前被其它操作修改', currentContent);
+      }
     }
     this.removeFromTree(filePath);
     this.memoryFiles.delete(filePath);
@@ -720,7 +882,18 @@ class FileSystemService {
         // worktree 根专用：取树即返回，不写主工作区缓存（list_dir 用，UI 面板不受影响）。
         return await window.synapse.workspace.tree(rootOverride, maxDepth, access);
       }
-      const tree = await window.synapse.workspace.tree(this.getCurrentWorkspacePath(), maxDepth, access);
+      const workspacePath = this.getCurrentWorkspacePath();
+      if (!workspacePath) return this.fileTree;
+      const workspaceId = this.currentWorkspace;
+      const workspaceGeneration = this.workspaceGeneration;
+      const tree = await window.synapse.workspace.tree(workspacePath, maxDepth, access);
+      if (
+        !this.isWorkspaceTransitionCurrent(workspaceGeneration)
+        || this.currentWorkspace !== workspaceId
+        || workspacePathKey(this.getCurrentWorkspacePath()) !== workspacePathKey(workspacePath)
+      ) {
+        return this.fileTree;
+      }
       this.fileTree = tree;
       this.workspaceTrees.set(this.currentWorkspace, tree);
       return tree;

@@ -25,8 +25,28 @@ async function main() {
   chatModule = require('../dist-electron/electron/provider/windsurfChat.js');
   databaseModule.initDatabase();
 
-  const status = await windsurfModule.windsurfController.status();
-  assert.equal(status.connected, true, 'Windsurf encrypted credential was not imported');
+  let imported = await windsurfModule.windsurfController.importLocal({ requesterId: process.pid });
+  if (!imported.ok && imported.error?.code === 'multiple_accounts') {
+    const requestedSource = process.env.SYNAPSE_WINDSURF_LIVE_SOURCE?.trim().toLocaleLowerCase();
+    assert.ok(
+      requestedSource,
+      'Multiple local Windsurf accounts found; set SYNAPSE_WINDSURF_LIVE_SOURCE to one explicit candidate source',
+    );
+    const candidates = imported.candidates ?? imported.error.candidates ?? [];
+    const matches = candidates.filter(candidate => (
+      candidate.source
+        .split(' / ')
+        .some(source => source.trim().toLocaleLowerCase() === requestedSource)
+    ));
+    assert.equal(matches.length, 1, `Expected exactly one local Windsurf candidate for source: ${requestedSource}`);
+    imported = await windsurfModule.windsurfController.importLocal({
+      requesterId: process.pid,
+      candidateFingerprint: matches[0].candidateFingerprint,
+    });
+  }
+  assert.equal(imported.ok, true, `Windsurf local account import failed: ${imported.error?.code ?? 'unknown'}`);
+  const status = imported.status;
+  assert.equal(status.connected, true, 'Windsurf local account was not imported');
   assert.equal(status.persisted, true, 'Imported Windsurf credential was not persisted with safeStorage');
 
   const stored = databaseModule.getDatabase()

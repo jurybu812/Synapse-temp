@@ -11,7 +11,7 @@
  *      active 默认展开（实时看 AI 在干嘛），done/aborted 默认收起（干净，点开看细节）。
  *   ⑥ 历史变迁浮层（比 Antigravity 多做）：点「历史」→ createPortal 列 headline/summary 变迁时间线。
  *
- * 纯展示组件：吃 props（boundary / files / children），不订阅 store；文件点击经 onOpenFile 回调上抛。
+ * 展示主体吃 props（conversationId / boundary / files / children）；折叠持久化严格绑定所属对话，文件点击经 onOpenFile 回调上抛。
  */
 import { Children, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
@@ -23,7 +23,7 @@ import {
   tailMessageWindowRange,
   type MessageWindowRange,
 } from '@/components/chat/useMessageWindow';
-import type { TaskBoundary } from '@/store/slices/conversation';
+import { type TaskBoundary } from '@/store/slices/conversation';
 
 /** 卡片聚合展示的「已编辑文件」（由 AgentPanel 从区间消息的 diffs / artifacts 聚合后传入）。 */
 export interface BoundaryFile {
@@ -38,25 +38,32 @@ export interface BoundaryFile {
 }
 
 interface TaskBoundaryCardProps {
+  conversationId: string;
   boundary: TaskBoundary;
   files?: BoundaryFile[];
   onOpenFile?: (file: BoundaryFile) => void;
   children?: ReactNode;                               // 区间内的过程消息（MessageBubble 们）
   items?: unknown[];                                  // 大边界按需渲染的数据项；避免父层提前创建全部 MessageBubble 元素
+  itemCount?: number;                                 // 真正的大边界只传数量与按需读取器，父层不构造完整数组
+  itemAt?: (index: number) => unknown;
+  itemIdAt?: (index: number) => string | undefined;
+  findItemIndex?: (itemId: string) => number;
   renderItem?: (item: unknown) => ReactNode;
   childCount?: number;                                // 过程消息条数（折叠态显示「展开完整过程 (N条)」）
   onEnd?: () => void;                                 // ★ H1：手动收口当前 active 边界（用户兜底，防卡住）
   followTail?: boolean;                               // 外层消息区贴底时才让 active 边界随新增过程滑到尾部
   revealItemId?: string;                              // 导航/重载锚点要求显式挂载的边界内消息
+  revealStepId?: string;                              // 重载锚点要求显式挂载的边界进度 step
   revealNonce?: number;                               // 同一消息重复导航时仍可区分的一次性请求编号
   onRevealConsumed?: (nonce: number) => void;         // 挂载目标后清除请求，避免后续 append 反复回拉
 }
 
-/** 状态 → 强调色 + 文案（active 主色 / done 绿 / aborted 红）。 */
+/** 状态 → 强调色 + 文案（active 主色 / done 绿 / interrupted 琥珀 / aborted 红）。 */
 function statusMeta(status: TaskBoundary['status']): { color: string; label: string } {
   switch (status) {
     case 'active': return { color: 'var(--syn-primary)', label: '进行中' };
     case 'done': return { color: '#22c55e', label: '已完成' };
+    case 'interrupted': return { color: '#f59e0b', label: '已按新要求切换' };
     case 'aborted': return { color: '#ef4444', label: '已中止' };
     default: return { color: 'var(--syn-text-muted)', label: status };
   }
@@ -95,33 +102,67 @@ const INITIAL_STEP_RENDER_ITEMS = 80;
 const STEP_RENDER_BATCH = 40;
 const MAX_STEP_RENDER_ITEMS = 160;
 
-function disclosureStorageKey(boundaryId: string, section: 'steps' | 'body'): string {
-  return `synapse:task-boundary:${boundaryId}:${section}:open`;
+type DisclosureSection = 'steps' | 'body';
+type DisclosureNext = boolean | ((current: boolean) => boolean);
+type OuterScrollAnchorKind = 'unit' | 'message' | 'boundary' | 'step';
+type OuterScrollAnchor = {
+  kind: OuterScrollAnchorKind;
+  id: string;
+  offsetTop: number;
+  alignToViewportTop: boolean;
+};
+
+const OUTER_SCROLL_ANCHOR_SELECTOR = '[data-message-window-unit-id], [data-message-id], [data-task-boundary-id], [data-task-step-id]';
+const OUTER_SCROLL_TAIL_THRESHOLD_PX = 60;
+
+function storageKeyPart(value: string): string {
+  return encodeURIComponent(value);
 }
 
-function readDisclosureState(boundaryId: string, section: 'steps' | 'body', fallback: boolean): boolean {
+function disclosureStorageKey(conversationId: string, boundaryId: string, section: DisclosureSection): string {
+  return `synapse:task-boundary:v2:${storageKeyPart(conversationId)}:${storageKeyPart(boundaryId)}:${section}:open`;
+}
+
+function resolveDisclosureNext(next: DisclosureNext, current: boolean): boolean {
+  return typeof next === 'function' ? next(current) : next;
+}
+
+function readDisclosureState(storageKey: string, fallback: boolean): boolean {
   try {
-    const stored = localStorage.getItem(disclosureStorageKey(boundaryId, section));
+    const stored = localStorage.getItem(storageKey);
     return stored === null ? fallback : stored === 'true';
   } catch {
     return fallback;
   }
 }
 
-function usePersistedDisclosure(boundaryId: string, section: 'steps' | 'body', fallback: boolean) {
-  const [open, setOpenState] = useState(() => readDisclosureState(boundaryId, section, fallback));
-  const setOpen = useCallback((next: boolean | ((current: boolean) => boolean)) => {
+function usePersistedDisclosure(storageKey: string, fallback: boolean) {
+  const [open, setOpenState] = useState(() => readDisclosureState(storageKey, fallback));
+  const currentStorageKeyRef = useRef(storageKey);
+
+  useEffect(() => {
+    if (currentStorageKeyRef.current === storageKey) return;
+    currentStorageKeyRef.current = storageKey;
+    setOpenState(readDisclosureState(storageKey, fallback));
+  }, [storageKey, fallback]);
+
+  const setOpen = useCallback((next: DisclosureNext) => {
     setOpenState(current => {
-      const value = typeof next === 'function' ? next(current) : next;
+      const value = resolveDisclosureNext(next, current);
       try {
-        localStorage.setItem(disclosureStorageKey(boundaryId, section), String(value));
+        localStorage.setItem(storageKey, String(value));
       } catch {
         // localStorage 不可用时仍保留当前会话内的展开状态。
       }
       return value;
     });
-  }, [boundaryId, section]);
-  return [open, setOpen] as const;
+  }, [storageKey]);
+
+  const setOpenForSession = useCallback((next: DisclosureNext) => {
+    setOpenState(current => resolveDisclosureNext(next, current));
+  }, []);
+
+  return [open, setOpen, setOpenForSession] as const;
 }
 
 function itemIdOf(item: unknown): string | undefined {
@@ -136,6 +177,89 @@ function overlapAnchorIndex(current: MessageWindowRange, next: MessageWindowRang
   return start < end ? start : undefined;
 }
 
+function outerScrollContainerFor(element: HTMLElement | null): HTMLElement | null {
+  return element?.closest('.agent-messages') as HTMLElement | null;
+}
+
+function outerAnchorIdentity(element: HTMLElement): { kind: OuterScrollAnchorKind; id: string } | undefined {
+  const unitId = element.dataset.messageWindowUnitId;
+  if (unitId) return { kind: 'unit', id: unitId };
+  const messageId = element.dataset.messageId;
+  if (messageId) return { kind: 'message', id: messageId };
+  const boundaryId = element.dataset.taskBoundaryId;
+  if (boundaryId) return { kind: 'boundary', id: boundaryId };
+  const stepId = element.dataset.taskStepId;
+  if (stepId) return { kind: 'step', id: stepId };
+  return undefined;
+}
+
+function outerAnchorSelector(anchor: OuterScrollAnchor): string {
+  const escapedId = CSS.escape(anchor.id);
+  switch (anchor.kind) {
+    case 'unit':
+      return `[data-message-window-unit-id="${escapedId}"]`;
+    case 'message':
+      return `[data-message-id="${escapedId}"]`;
+    case 'boundary':
+      return `[data-task-boundary-id="${escapedId}"]`;
+    case 'step':
+      return `[data-task-step-id="${escapedId}"]`;
+    default:
+      return '';
+  }
+}
+
+function isOuterScrollNearTail(container: HTMLElement, thresholdPx = OUTER_SCROLL_TAIL_THRESHOLD_PX): boolean {
+  const bottomDistancePx = container.scrollHeight - container.scrollTop - container.clientHeight;
+  return Number.isFinite(bottomDistancePx) && bottomDistancePx <= Math.max(0, thresholdPx);
+}
+
+function captureOuterScrollAnchor(container: HTMLElement): OuterScrollAnchor | undefined {
+  const containerRect = container.getBoundingClientRect();
+  const candidates = Array.from(container.querySelectorAll<HTMLElement>(OUTER_SCROLL_ANCHOR_SELECTOR))
+    .map((element, order) => {
+      const identity = outerAnchorIdentity(element);
+      if (!identity) return undefined;
+      const rect = element.getBoundingClientRect();
+      if (rect.bottom <= containerRect.top + 1 || rect.top >= containerRect.bottom - 1) return undefined;
+      return {
+        element,
+        identity,
+        rect,
+        order,
+        visibleTop: Math.max(rect.top, containerRect.top),
+      };
+    })
+    .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined);
+  const specificCandidates = candidates.filter(candidate => (
+    candidate.identity.kind === 'message' || candidate.identity.kind === 'step'
+  ));
+  const anchorCandidates = specificCandidates.length > 0 ? specificCandidates : candidates;
+  anchorCandidates.sort((left, right) => left.visibleTop - right.visibleTop || left.order - right.order);
+  const candidate = anchorCandidates[0];
+  if (!candidate) return undefined;
+  const rawOffset = candidate.rect.top - containerRect.top;
+  const alignToViewportTop = rawOffset < 0 && candidate.rect.height > container.clientHeight;
+  return {
+    kind: candidate.identity.kind,
+    id: candidate.identity.id,
+    offsetTop: alignToViewportTop ? 0 : rawOffset,
+    alignToViewportTop,
+  };
+}
+
+function restoreOuterScrollAnchor(container: HTMLElement, anchor?: OuterScrollAnchor): void {
+  if (!anchor) return;
+  const selector = outerAnchorSelector(anchor);
+  if (!selector) return;
+  const anchorElement = container.querySelector<HTMLElement>(selector);
+  if (!anchorElement) return;
+  const rawOffset = anchorElement.getBoundingClientRect().top - container.getBoundingClientRect().top;
+  const offsetTop = anchor.alignToViewportTop ? Math.max(0, rawOffset) : rawOffset;
+  const delta = offsetTop - anchor.offsetTop;
+  if (Math.abs(delta) > 0.5) container.scrollTop += delta;
+}
+
 /** 历史变迁浮层：createPortal 到 body 的 glass-panel，倒序时间线，点外 / Esc 关闭。 */
 function HistoryOverlay({ history, now, onClose }: {
   history: TaskBoundary['history'];
@@ -143,6 +267,7 @@ function HistoryOverlay({ history, now, onClose }: {
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
 
   const handleClickOutside = useCallback((e: MouseEvent) => {
     if (ref.current && !ref.current.contains(e.target as Node)) onClose();
@@ -161,15 +286,28 @@ function HistoryOverlay({ history, now, onClose }: {
     };
   }, [handleClickOutside, handleKey]);
 
+  useEffect(() => {
+    closeButtonRef.current?.focus();
+  }, []);
+
   const ordered = [...history].reverse();
 
   return createPortal(
     <div className="task-boundary-history-backdrop">
-      <div ref={ref} className="task-boundary-history-overlay glass-panel" role="dialog" aria-label="标题变迁历史">
+      <div ref={ref} className="task-boundary-history-overlay glass-panel" role="dialog" aria-modal="true" aria-label="标题变迁历史">
         <div className="tb-history-header">
           <History size={14} />
           <span className="tb-history-title">标题变迁历史</span>
           <span className="tb-history-count">{history.length} 次</span>
+          <button
+            ref={closeButtonRef}
+            type="button"
+            className="tb-card-history-btn"
+            onClick={onClose}
+            aria-label="关闭标题变迁历史"
+          >
+            关闭
+          </button>
         </div>
         {ordered.length === 0 ? (
           <div className="tb-history-empty">暂无历史记录</div>
@@ -193,19 +331,34 @@ function HistoryOverlay({ history, now, onClose }: {
   );
 }
 
-export function TaskBoundaryCard({ boundary, files = [], onOpenFile, children, items, renderItem, childCount = 0, onEnd, followTail = true, revealItemId, revealNonce, onRevealConsumed }: TaskBoundaryCardProps) {
+export function TaskBoundaryCard({ conversationId, boundary, files = [], onOpenFile, children, items, itemCount, itemAt, itemIdAt, findItemIndex, renderItem, childCount = 0, onEnd, followTail = true, revealItemId, revealStepId, revealNonce, onRevealConsumed }: TaskBoundaryCardProps) {
   const isActive = boundary.status === 'active';
-  // ★ 进度与过程：active 默认展开；done/aborted 默认收起。用户手动开合会按 boundary 持久，重载不反复撑开长页。
-  const [bodyOpen, setBodyOpen] = usePersistedDisclosure(boundary.id, 'body', isActive);
-  const [stepsOpen, setStepsOpen] = usePersistedDisclosure(boundary.id, 'steps', isActive);
+  const bodyStorageKey = useMemo(
+    () => disclosureStorageKey(conversationId, boundary.id, 'body'),
+    [boundary.id, conversationId],
+  );
+  const stepsStorageKey = useMemo(
+    () => disclosureStorageKey(conversationId, boundary.id, 'steps'),
+    [boundary.id, conversationId],
+  );
+  // ★ 进度与过程：active 默认展开；done/aborted 默认收起。用户手动开合会按 conversation + boundary 持久，重载不反复撑开长页。
+  const [bodyOpen, setBodyOpen, setBodyOpenForSession] = usePersistedDisclosure(bodyStorageKey, isActive);
+  const [stepsOpen, setStepsOpen, setStepsOpenForSession] = usePersistedDisclosure(stepsStorageKey, isActive);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const historyTriggerRef = useRef<HTMLButtonElement>(null);
   const bodyContainerRef = useRef<HTMLDivElement>(null);
   const stepsContainerRef = useRef<HTMLOListElement>(null);
-  const bodyItems = useMemo(() => items ?? Children.toArray(children), [items, children]);
+  const fallbackBodyItems = useMemo(() => items ?? Children.toArray(children), [items, children]);
+  const bodyItemCount = itemCount ?? fallbackBodyItems.length;
+  const getBodyItem = useCallback(
+    (index: number) => itemAt ? itemAt(index) : fallbackBodyItems[index],
+    [fallbackBodyItems, itemAt],
+  );
   const [visibleBodyRange, setVisibleBodyRange] = useState<MessageWindowRange>(() => (
-    tailMessageWindowRange(bodyItems.length, INITIAL_BODY_RENDER_ITEMS, MAX_BODY_RENDER_ITEMS)
+    tailMessageWindowRange(bodyItemCount, INITIAL_BODY_RENDER_ITEMS, MAX_BODY_RENDER_ITEMS)
   ));
-  const previousBodyItemCountRef = useRef(bodyItems.length);
+  const previousBodyItemCountRef = useRef(bodyItemCount);
   const [visibleStepRange, setVisibleStepRange] = useState<MessageWindowRange>(() => (
     tailMessageWindowRange(boundary.steps.length, INITIAL_STEP_RENDER_ITEMS, MAX_STEP_RENDER_ITEMS)
   ));
@@ -214,13 +367,13 @@ export function TaskBoundaryCard({ boundary, files = [], onOpenFile, children, i
 
   useEffect(() => {
     const previousCount = previousBodyItemCountRef.current;
-    setVisibleBodyRange(current => messageWindowRangeAfterUnitChange(bodyItems.length, previousCount, current, {
+    setVisibleBodyRange(current => messageWindowRangeAfterUnitChange(bodyItemCount, previousCount, current, {
       initialUnits: INITIAL_BODY_RENDER_ITEMS,
       maxUnits: MAX_BODY_RENDER_ITEMS,
       tailPinned: followTail,
     }));
-    previousBodyItemCountRef.current = bodyItems.length;
-  }, [bodyItems.length, followTail]);
+    previousBodyItemCountRef.current = bodyItemCount;
+  }, [bodyItemCount, followTail]);
 
   useEffect(() => {
     const previousCount = previousStepCountRef.current;
@@ -234,26 +387,40 @@ export function TaskBoundaryCard({ boundary, files = [], onOpenFile, children, i
 
   useEffect(() => {
     if (!revealItemId || revealNonce === undefined || consumedRevealNonceRef.current === revealNonce) return;
-    const targetIndex = bodyItems.findIndex(item => (
-      typeof item === 'object' && item !== null && 'id' in item && (item as { id?: unknown }).id === revealItemId
-    ));
+    const targetIndex = findItemIndex
+      ? findItemIndex(revealItemId)
+      : fallbackBodyItems.findIndex(item => (
+          typeof item === 'object' && item !== null && 'id' in item && (item as { id?: unknown }).id === revealItemId
+        ));
     if (targetIndex < 0) return;
     consumedRevealNonceRef.current = revealNonce;
-    setBodyOpen(true);
-    setVisibleBodyRange(messageWindowRangeForIndex(bodyItems.length, targetIndex, MAX_BODY_RENDER_ITEMS, 8));
+    setBodyOpenForSession(true);
+    setVisibleBodyRange(messageWindowRangeForIndex(bodyItemCount, targetIndex, MAX_BODY_RENDER_ITEMS, 8));
     onRevealConsumed?.(revealNonce);
-  }, [bodyItems, onRevealConsumed, revealItemId, revealNonce, setBodyOpen]);
+  }, [bodyItemCount, fallbackBodyItems, findItemIndex, onRevealConsumed, revealItemId, revealNonce, setBodyOpenForSession]);
+
+  useEffect(() => {
+    if (!revealStepId || revealNonce === undefined || consumedRevealNonceRef.current === revealNonce) return;
+    const targetIndex = boundary.steps.findIndex(step => step.id === revealStepId);
+    if (targetIndex < 0) return;
+    consumedRevealNonceRef.current = revealNonce;
+    setStepsOpenForSession(true);
+    setVisibleStepRange(messageWindowRangeForIndex(boundary.steps.length, targetIndex, MAX_STEP_RENDER_ITEMS, 8));
+    onRevealConsumed?.(revealNonce);
+  }, [boundary.steps, onRevealConsumed, revealNonce, revealStepId, setStepsOpenForSession]);
 
   const moveBodyItems = useCallback((direction: 'older' | 'newer') => {
     const nextRange = moveMessageWindowRange(
-      bodyItems.length,
+      bodyItemCount,
       visibleBodyRange,
       direction,
       BODY_RENDER_BATCH,
       MAX_BODY_RENDER_ITEMS,
     );
     const anchorIndex = overlapAnchorIndex(visibleBodyRange, nextRange);
-    const overlapAnchorId = anchorIndex === undefined ? undefined : itemIdOf(bodyItems[anchorIndex]);
+    const overlapAnchorId = anchorIndex === undefined
+      ? undefined
+      : itemIdAt?.(anchorIndex) ?? itemIdOf(getBodyItem(anchorIndex));
     const scrollContainer = bodyContainerRef.current?.closest('.agent-messages') as HTMLElement | null;
     const anchorElement = overlapAnchorId
       ? bodyContainerRef.current?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(overlapAnchorId)}"]`)
@@ -273,7 +440,7 @@ export function TaskBoundaryCard({ boundary, files = [], onOpenFile, children, i
           - anchorOffset;
       });
     }
-  }, [bodyItems, visibleBodyRange]);
+  }, [bodyItemCount, getBodyItem, itemIdAt, visibleBodyRange]);
 
   const loadOlderBodyItems = useCallback(() => moveBodyItems('older'), [moveBodyItems]);
   const loadNewerBodyItems = useCallback(() => moveBodyItems('newer'), [moveBodyItems]);
@@ -311,6 +478,49 @@ export function TaskBoundaryCard({ boundary, files = [], onOpenFile, children, i
   const loadOlderSteps = useCallback(() => moveSteps('older'), [moveSteps]);
   const loadNewerSteps = useCallback(() => moveSteps('newer'), [moveSteps]);
 
+  const restoreOuterScrollAfterDisclosure = useCallback((
+    scrollContainer: HTMLElement | null,
+    anchor: OuterScrollAnchor | undefined,
+    wasNearTailBeforeToggle: boolean,
+  ) => {
+    if (!scrollContainer || typeof window === 'undefined') return;
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const currentContainer = outerScrollContainerFor(cardRef.current) ?? scrollContainer;
+        if (wasNearTailBeforeToggle) {
+          currentContainer.scrollTop = currentContainer.scrollHeight;
+          return;
+        }
+        restoreOuterScrollAnchor(currentContainer, anchor);
+      });
+    });
+  }, []);
+
+  const toggleDisclosureWithOuterAnchor = useCallback((toggle: () => void) => {
+    const scrollContainer = outerScrollContainerFor(cardRef.current);
+    const wasNearTailBeforeToggle = scrollContainer
+      ? isOuterScrollNearTail(scrollContainer)
+      : followTail;
+    const anchor = scrollContainer && !wasNearTailBeforeToggle
+      ? captureOuterScrollAnchor(scrollContainer)
+      : undefined;
+    toggle();
+    restoreOuterScrollAfterDisclosure(scrollContainer, anchor, wasNearTailBeforeToggle);
+  }, [followTail, restoreOuterScrollAfterDisclosure]);
+
+  const handleStepsToggle = useCallback(() => {
+    toggleDisclosureWithOuterAnchor(() => setStepsOpen(open => !open));
+  }, [setStepsOpen, toggleDisclosureWithOuterAnchor]);
+
+  const handleBodyToggle = useCallback(() => {
+    toggleDisclosureWithOuterAnchor(() => setBodyOpen(open => !open));
+  }, [setBodyOpen, toggleDisclosureWithOuterAnchor]);
+
+  const closeHistoryOverlay = useCallback(() => {
+    setHistoryOpen(false);
+    requestAnimationFrame(() => historyTriggerRef.current?.focus());
+  }, []);
+
   // ★ active 边界 / 历史浮层开启时按秒滴答刷新相对时间（非 active 不开 timer 省开销）。
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -319,26 +529,40 @@ export function TaskBoundaryCard({ boundary, files = [], onOpenFile, children, i
     return () => window.clearInterval(timer);
   }, [isActive, historyOpen]);
 
-  // ★ active → done/aborted 翻转时自动收起进度与过程（收口即归整，呼应反重力「完成后折叠成一卡」）。
+  // ★ active → done/aborted 翻转时，只有用户贴底跟随当前任务才自动收起；历史浏览时保持当前高度，避免视口跳动。
   const prevActiveRef = useRef(isActive);
   useEffect(() => {
-    if (prevActiveRef.current && !isActive) {
-      setBodyOpen(false);
-      setStepsOpen(false);
+    if (prevActiveRef.current && !isActive && followTail) {
+      setBodyOpenForSession(false);
+      setStepsOpenForSession(false);
     }
     prevActiveRef.current = isActive;
-  }, [isActive, setBodyOpen, setStepsOpen]);
+  }, [followTail, isActive, setBodyOpenForSession, setStepsOpenForSession]);
+
+  useEffect(() => {
+    if (boundary.status !== 'aborted' && boundary.status !== 'interrupted') return;
+    setVisibleBodyRange(tailMessageWindowRange(bodyItemCount, INITIAL_BODY_RENDER_ITEMS, MAX_BODY_RENDER_ITEMS));
+    setVisibleStepRange(tailMessageWindowRange(boundary.steps.length, INITIAL_STEP_RENDER_ITEMS, MAX_STEP_RENDER_ITEMS));
+  }, [bodyItemCount, boundary.status, boundary.steps.length]);
 
   const meta = statusMeta(boundary.status);
   const stepCount = boundary.steps.length;
   const historyDisabled = boundary.history.length === 0;
-  const effectiveChildCount = childCount || bodyItems.length;
+  const effectiveChildCount = childCount || bodyItemCount;
   const hasBody = effectiveChildCount > 0;
-  const visibleBodyItems = bodyItems.slice(visibleBodyRange.start, visibleBodyRange.end);
+  const visibleBodyItems = useMemo(() => {
+    if (!bodyOpen) return [];
+    const visible: unknown[] = [];
+    for (let index = visibleBodyRange.start; index < visibleBodyRange.end; index++) {
+      const item = getBodyItem(index);
+      if (item !== undefined) visible.push(item);
+    }
+    return visible;
+  }, [bodyOpen, getBodyItem, visibleBodyRange.end, visibleBodyRange.start]);
   const visibleSteps = boundary.steps.slice(visibleStepRange.start, visibleStepRange.end);
 
   return (
-    <div className="task-boundary-card" data-task-boundary-id={boundary.id} style={{ borderLeftColor: meta.color }}>
+    <div ref={cardRef} className="task-boundary-card" data-task-boundary-id={boundary.id} style={{ borderLeftColor: meta.color }}>
       <div className="tb-card-header">
         <span className={`tb-card-dot${isActive ? ' pulsing' : ''}`} style={{ background: meta.color }} />
         <span className="tb-card-headline" title={boundary.headline}>{boundary.headline}</span>
@@ -346,6 +570,7 @@ export function TaskBoundaryCard({ boundary, files = [], onOpenFile, children, i
           {meta.label}
         </span>
         <button
+          ref={historyTriggerRef}
           type="button"
           className="tb-card-history-btn"
           onClick={() => setHistoryOpen(true)}
@@ -409,7 +634,7 @@ export function TaskBoundaryCard({ boundary, files = [], onOpenFile, children, i
           <button
             type="button"
             className="tb-card-section-label tb-card-steps-toggle"
-            onClick={() => setStepsOpen(o => !o)}
+            onClick={handleStepsToggle}
             aria-expanded={stepsOpen}
           >
             {stepsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
@@ -452,7 +677,7 @@ export function TaskBoundaryCard({ boundary, files = [], onOpenFile, children, i
           <button
             type="button"
             className="tb-card-body-toggle"
-            onClick={() => setBodyOpen(o => !o)}
+            onClick={handleBodyToggle}
             aria-expanded={bodyOpen}
           >
             {bodyOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
@@ -467,9 +692,9 @@ export function TaskBoundaryCard({ boundary, files = [], onOpenFile, children, i
                 </button>
               )}
               {visibleBodyItems.map(item => renderItem ? renderItem(item) : item as ReactNode)}
-              {visibleBodyRange.end < bodyItems.length && (
+              {visibleBodyRange.end < bodyItemCount && (
                 <button type="button" className="tb-card-body-loader" onClick={loadNewerBodyItems}>
-                  加载更新过程 · 距最新还剩 {bodyItems.length - visibleBodyRange.end} 条
+                  加载更新过程 · 距最新还剩 {bodyItemCount - visibleBodyRange.end} 条
                 </button>
               )}
             </div>
@@ -481,7 +706,7 @@ export function TaskBoundaryCard({ boundary, files = [], onOpenFile, children, i
         <HistoryOverlay
           history={boundary.history}
           now={now}
-          onClose={() => setHistoryOpen(false)}
+          onClose={closeHistoryOverlay}
         />
       )}
     </div>

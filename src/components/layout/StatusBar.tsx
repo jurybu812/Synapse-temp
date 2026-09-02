@@ -7,12 +7,16 @@ import { getModelContextWindow } from '@/store/selectors/modelSelectors';
 import { buildTokenEntryDetail, CompressionRing, getCacheHitRate } from './CompressionRing';
 import { resolveProviderModel } from '@/services/providerModelRuntime';
 
+function isLiveAssistantRunStatus(status: unknown): boolean {
+  return status === 'idle' || status === 'pending' || status === 'streaming';
+}
+
 export function StatusBar() {
   const messages = useAppSelector((s) => s.conversation.messages);
   const model = useAppSelector((s) => s.agentSettings.currentModel);
   const isStreaming = useAppSelector((s) => s.conversation.isStreaming);
   const isAgentRunActive = useAppSelector((s) => (
-    Object.values(s.conversation.assistantRuns).some(run => run.status === 'streaming')
+    s.conversation.isStreaming || Object.values(s.conversation.assistantRuns).some(run => isLiveAssistantRunStatus(run.status))
   ));
   const tokenUsage = useAppSelector((s) => s.conversation.tokenUsage);
   const projectedTokenCount = useAppSelector((s) => s.conversation.tokenCount);
@@ -41,11 +45,11 @@ export function StatusBar() {
   //   可接受；有 API 实测 tokenUsage 时本就优先用实测、不受影响），停流后重算一次精确值。
   const lastLocalTokenRef = useRef<{ count: number; exact: boolean }>({ count: 0, exact: false });
   const localToken = useMemo(() => {
-    if (isStreaming) return lastLocalTokenRef.current;
+    if (isAgentRunActive) return lastLocalTokenRef.current;
     const v = countConversationTokensExact(messages.map(m => ({ role: m.role, content: m.content })), model);
     lastLocalTokenRef.current = v;
     return v;
-  }, [messages, model, isStreaming]);
+  }, [messages, model, isAgentRunActive]);
   // M4-1-S3（openQuestions 4 决议）：「已用 token」与「上下文窗口」分母同口径（纯输入侧）。
   //   请求组装后优先显示当前待发送体投影；API usage 回写时 reducer 会把同一字段替换为精确 promptTokens。
   const hasApiUsage = tokenCountSource === 'api' && !!tokenUsage;

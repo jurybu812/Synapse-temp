@@ -965,7 +965,7 @@
 .task-boundary-card {
   min-width: 0;
   max-width: 100%;
-  overflow: hidden;
+  overflow: clip;
   border: 1px solid var(--syn-border);
   border-left: 3px solid var(--syn-primary);
   border-radius: 8px;
@@ -980,6 +980,14 @@
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  margin: -10px -12px 0;
+  padding: 10px 12px 6px;
+  background: color-mix(in srgb, var(--syn-bg-elevated) 92%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 .tb-card-dot {
   width: 9px;

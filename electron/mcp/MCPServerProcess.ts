@@ -21,6 +21,7 @@ import { EventEmitter } from 'events';
 export interface MCPProcessOptions {
     transport?: 'stdio' | 'http';
     url?: string;
+    initializeTimeoutMs?: number;
 }
 
 interface JSONRPCRequest {
@@ -49,12 +50,8 @@ export class MCPServerProcess extends EventEmitter {
     private requestId = 0;
     private pending = new Map<number, PendingRequest>();
     private _status: 'stopped' | 'starting' | 'running' | 'error' = 'stopped';
-    /**
-     * ★ M4-7-S1：start() 期间监听 spawn error（ENOENT / 路径错）的快速失败回调。
-     *   spawn 是异步的——'error' 事件在 start() 的 await initialize 之后才到达。把进行中 start 的
-     *   reject 暂存在这里，process.on('error') 触发时立刻调用它，让 start() 秒级失败而非苦等 30s timeout。
-     */
-    private startErrorReject: ((err: Error) => void) | null = null;
+    private stdioLifecycleGeneration = 0;
+    private stdioStartPromise: Promise<void> | null = null;
 
     /**
      * ★ #16 HTTP transport 状态。
@@ -64,7 +61,12 @@ export class MCPServerProcess extends EventEmitter {
      */
     private readonly isHttp: boolean;
     private readonly httpUrl: string;
+    private readonly initializeTimeoutMs: number;
     private sessionId: string | null = null;
+    private httpLifecycleGeneration = 0;
+    private httpStartPromise: Promise<void> | null = null;
+    private httpReinitPromise: Promise<void> | null = null;
+    private httpLifecycleAbortController = new AbortController();
 
     constructor(
         public readonly name: string,
@@ -77,74 +79,74 @@ export class MCPServerProcess extends EventEmitter {
         // HTTP 判定：显式 transport:'http'，或「给了 url 且没给 command」（隐式）。
         this.httpUrl = opts?.url ?? '';
         this.isHttp = opts?.transport === 'http' || (!!this.httpUrl && !command);
+        this.initializeTimeoutMs = Math.max(10_000, opts?.initializeTimeoutMs ?? 30_000);
     }
 
     get status() { return this._status; }
 
     async start(): Promise<void> {
-        // ★ #16 HTTP 分支：不 spawn 子进程，走 Streamable HTTP 握手。
-        if (this.isHttp) {
-            return this.startHttp();
-        }
-
-        if (this.process) return;
+        if (this.isHttp) return this.startHttp();
+        if (this._status === 'running') return;
+        if (this.stdioStartPromise) return this.stdioStartPromise;
+        const generation = ++this.stdioLifecycleGeneration;
         this._status = 'starting';
+        const startPromise = this.startStdioGeneration(generation);
+        this.stdioStartPromise = startPromise;
+        try {
+            await startPromise;
+        } finally {
+            if (this.stdioStartPromise === startPromise) this.stdioStartPromise = null;
+        }
+    }
 
-        this.process = spawn(this.command, this.args, {
+    private async startStdioGeneration(generation: number): Promise<void> {
+        const child = spawn(this.command, this.args, {
             stdio: ['pipe', 'pipe', 'pipe'],
             env: { ...process.env, ...this.env },
             // ★ M4-7-S1：去黑框——Windows 下 spawn node 子进程默认会闪一个控制台窗口。
             windowsHide: true,
         });
+        this.process = child;
 
-        this.process.stdout?.on('data', (data: Buffer) => {
+        child.stdout?.on('data', (data: Buffer) => {
             this.buffer += data.toString();
             this.processBuffer();
         });
 
-        this.process.stderr?.on('data', (data: Buffer) => {
+        child.stderr?.on('data', (data: Buffer) => {
             console.error(`[MCP:${this.name}] stderr:`, data.toString().trim());
         });
 
-        this.process.on('close', (code) => {
+        child.on('close', (code) => {
             console.log(`[MCP:${this.name}] exited with code ${code}`);
-            this._status = 'stopped';
+            if (this.process !== child) return;
             this.process = null;
-            // Reject all pending requests
-            for (const [id, req] of this.pending) {
-                req.reject(new Error('MCP process exited'));
-                clearTimeout(req.timer);
-                this.pending.delete(id);
-            }
+            if (generation === this.stdioLifecycleGeneration) this._status = 'stopped';
+            this.rejectPendingRequests('MCP process exited');
             this.emit('close', code);
         });
 
-        this.process.on('error', (err) => {
+        child.on('error', (err) => {
             console.error(`[MCP:${this.name}] error:`, err.message);
-            this._status = 'error';
-            // ★ M4-7-S1 快速失败：spawn error（ENOENT / command 不存在 / 路径错）在 start() 的
-            //   await initialize 期间到达时，立刻 reject 进行中的 start，而不是让它干等 30s request timeout。
-            if (this.startErrorReject) {
-                this.startErrorReject(err);
-            }
+            if (this.process === child && generation === this.stdioLifecycleGeneration) this.transitionToError();
             this.emit('error', err);
         });
 
-        // Initialize：把 initialize 请求与「spawn error 事件」竞速（Promise.race）。
-        //   - 正常 server：initialize 先 resolve → running。
-        //   - spawn 失败：'error' 事件触发 startErrorReject 先 reject → 秒级失败，不等 timeout。
         try {
             const errorRace = new Promise<never>((_resolve, reject) => {
-                this.startErrorReject = reject;
+                child.once('error', reject);
             });
             const initPromise = this.request('initialize', {
                 protocolVersion: '2024-11-05',
                 // ★ M4-7-S1：声明客户端支持 tools（更规范；个别 server 会据此决定是否暴露 tools/list）。
                 capabilities: { tools: {} },
                 clientInfo: { name: 'synapse', version: '0.1.0' },
-            });
+            }, this.initializeTimeoutMs);
             await Promise.race([initPromise, errorRace]);
             await this.notify('notifications/initialized');
+            if (generation !== this.stdioLifecycleGeneration || this.process !== child) {
+                throw new Error(`MCP stdio start cancelled: ${this.name}`);
+            }
             this._status = 'running';
             console.log(`[MCP:${this.name}] initialized`);
             // ★ MCP 竞态修复：握手成功置 running 时主动广播事件。旧链路 mcpBridge.refresh() 只在
@@ -155,17 +157,21 @@ export class MCPServerProcess extends EventEmitter {
             this.emit('status-change', { name: this.name, status: 'running' });
             this.emit('ready', { name: this.name });
         } catch (err) {
-            this._status = 'error';
+            if (generation !== this.stdioLifecycleGeneration || this.process !== child) {
+                throw new Error(`MCP stdio start cancelled: ${this.name}`);
+            }
+            this.transitionToError();
             throw err;
-        } finally {
-            // 竞速结束后解除引用，避免后续 error 事件误调用旧 reject。
-            this.startErrorReject = null;
         }
     }
 
     async stop(): Promise<void> {
         // ★ #16 HTTP 分支：尽力对 endpoint 发 DELETE 终止 session（失败忽略），再置 stopped。
         if (this.isHttp) {
+            this.httpLifecycleGeneration += 1;
+            this.httpLifecycleAbortController.abort();
+            const pendingStart = this.httpStartPromise;
+            const pendingReinit = this.httpReinitPromise;
             const sid = this.sessionId;
             this.sessionId = null;
             this._status = 'stopped';
@@ -178,24 +184,31 @@ export class MCPServerProcess extends EventEmitter {
                     });
                 } catch { /* server 可能不支持 DELETE，忽略 */ }
             }
+            await Promise.allSettled([pendingStart, pendingReinit].filter(Boolean) as Promise<void>[]);
             this.emit('close', 0);
             return;
         }
 
-        if (!this.process) return;
-        this.process.kill('SIGTERM');
+        this.stdioLifecycleGeneration += 1;
+        const child = this.process;
+        this._status = 'stopped';
+        if (!child) {
+            this.rejectPendingRequests('MCP process stopped');
+            return;
+        }
+        child.kill('SIGTERM');
         await new Promise<void>(resolve => {
             const timer = setTimeout(() => {
-                this.process?.kill('SIGKILL');
+                child.kill('SIGKILL');
                 resolve();
             }, 5000);
-            this.process?.on('close', () => {
+            child.once('close', () => {
                 clearTimeout(timer);
                 resolve();
             });
         });
-        this.process = null;
-        this._status = 'stopped';
+        if (this.process === child) this.process = null;
+        this.rejectPendingRequests('MCP process stopped');
     }
 
     async request(method: string, params?: unknown, timeout = 30000): Promise<unknown> {
@@ -239,8 +252,23 @@ export class MCPServerProcess extends EventEmitter {
             return (result?.tools || []) as Array<{ name: string; description: string; inputSchema: unknown }>;
         } catch (err) {
             console.error(`[MCP:${this.name}] listTools failed:`, (err as Error)?.message);
+            if (this._status === 'running') this.transitionToError();
             return [];
         }
+    }
+
+    private rejectPendingRequests(message: string): void {
+        for (const [id, req] of this.pending) {
+            req.reject(new Error(message));
+            clearTimeout(req.timer);
+            this.pending.delete(id);
+        }
+    }
+
+    private transitionToError(): void {
+        if (this._status === 'error') return;
+        this._status = 'error';
+        this.emit('status-change', { name: this.name, status: 'error' });
     }
 
     async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -285,31 +313,58 @@ export class MCPServerProcess extends EventEmitter {
 
     /** initialize 握手（HTTP）：取并保存 session id，发 initialized 通知，置 running 并广播。 */
     private async startHttp(): Promise<void> {
-        if (this._status === 'running' || this._status === 'starting') return;
+        if (this._status === 'running') return;
+        if (this.httpStartPromise) return this.httpStartPromise;
+        const generation = ++this.httpLifecycleGeneration;
+        this.httpLifecycleAbortController = new AbortController();
         this._status = 'starting';
         this.sessionId = null;
+        const startPromise = this.startHttpGeneration(generation);
+        this.httpStartPromise = startPromise;
         try {
-            await this.handshakeHttp();
+            await startPromise;
+        } finally {
+            if (this.httpStartPromise === startPromise) this.httpStartPromise = null;
+        }
+    }
+
+    private async startHttpGeneration(generation: number): Promise<void> {
+        try {
+            await this.handshakeHttp(generation);
+            if (generation !== this.httpLifecycleGeneration) {
+                this.sessionId = null;
+                throw new Error(`MCP http start cancelled: ${this.name}`);
+            }
             this._status = 'running';
             console.log(`[MCP:${this.name}] initialized (http @ ${this.httpUrl}, session=${this.sessionId ?? 'none'})`);
             // 与 stdio 分支一致：握手成功广播，触发渲染端 mcpBridge.refresh() 补注册 mcp__* 工具。
             this.emit('status-change', { name: this.name, status: 'running' });
             this.emit('ready', { name: this.name });
         } catch (err) {
-            this._status = 'error';
-            console.error(`[MCP:${this.name}] http start failed:`, (err as Error)?.message);
+            if (generation === this.httpLifecycleGeneration) {
+                this._status = 'error';
+                console.error(`[MCP:${this.name}] http start failed:`, (err as Error)?.message);
+            } else {
+                this.sessionId = null;
+            }
             throw err;
         }
     }
 
     /** 纯握手序列（initialize + initialized 通知）——startHttp 与「session 失效后重握手」共用，不碰 _status/running guard。 */
-    private async handshakeHttp(): Promise<void> {
+    private async handshakeHttp(generation?: number): Promise<void> {
         await this.httpRequest('initialize', {
             protocolVersion: '2024-11-05',
             capabilities: { tools: {} },
             clientInfo: { name: 'synapse', version: '0.1.0' },
-        });
-        await this.httpNotify('notifications/initialized');
+        }, this.initializeTimeoutMs);
+        if (generation !== undefined && generation !== this.httpLifecycleGeneration) {
+            throw new Error(`MCP http start cancelled: ${this.name}`);
+        }
+        await this.httpNotify('notifications/initialized', undefined, this.initializeTimeoutMs);
+        if (generation !== undefined && generation !== this.httpLifecycleGeneration) {
+            throw new Error(`MCP http start cancelled: ${this.name}`);
+        }
     }
 
     /**
@@ -318,17 +373,27 @@ export class MCPServerProcess extends EventEmitter {
      *   调用永久失败而 status 仍报 running。此处绕过 running guard 重新握手一次，拿到新 session id。
      *   只在 httpRequest 的失效分支调用、且只重试一轮（reHandshaking 防重入），重握手仍失败则上层置 error。
      */
-    private reHandshaking = false;
     private async reinitHttp(): Promise<void> {
-        if (this.reHandshaking) return;
-        this.reHandshaking = true;
-        this.sessionId = null;
+        if (this.httpReinitPromise) return this.httpReinitPromise;
+        if (this._status !== 'running') throw new Error(`MCP http server is not running: ${this.name}`);
+        const generation = this.httpLifecycleGeneration;
+        const reinitPromise = this.reinitHttpGeneration(generation);
+        this.httpReinitPromise = reinitPromise;
         try {
-            await this.handshakeHttp();
-            console.log(`[MCP:${this.name}] http session re-initialized (session=${this.sessionId ?? 'none'})`);
+            await reinitPromise;
         } finally {
-            this.reHandshaking = false;
+            if (this.httpReinitPromise === reinitPromise) this.httpReinitPromise = null;
         }
+    }
+
+    private async reinitHttpGeneration(generation: number): Promise<void> {
+        this.sessionId = null;
+        await this.handshakeHttp(generation);
+        if (generation !== this.httpLifecycleGeneration || this._status !== 'running') {
+            this.sessionId = null;
+            throw new Error(`MCP http re-handshake cancelled: ${this.name}`);
+        }
+        console.log(`[MCP:${this.name}] http session re-initialized (session=${this.sessionId ?? 'none'})`);
     }
 
     /** 公共请求头：Accept（JSON + SSE）、Content-Type，已有 session id 时回带。 */
@@ -351,6 +416,9 @@ export class MCPServerProcess extends EventEmitter {
     }
 
     private async httpRequestOnce(method: string, params: unknown, timeout: number, _retried: boolean): Promise<unknown> {
+        const lifecycleGeneration = this.httpLifecycleGeneration;
+        const lifecycleSignal = this.httpLifecycleAbortController.signal;
+        const requestSessionId = this.sessionId;
         const id = ++this.requestId;
         const body = JSON.stringify({ jsonrpc: '2.0', id, method, params });
         let res: Response;
@@ -359,9 +427,12 @@ export class MCPServerProcess extends EventEmitter {
                 method: 'POST',
                 headers: this.httpHeaders(),
                 body,
-                signal: AbortSignal.timeout(timeout),
+                signal: AbortSignal.any([lifecycleSignal, AbortSignal.timeout(timeout)]),
             });
         } catch (err) {
+            if (lifecycleSignal.aborted || lifecycleGeneration !== this.httpLifecycleGeneration) {
+                throw new Error(`MCP http request cancelled: ${method}`);
+            }
             if ((err as Error)?.name === 'AbortError' || (err as Error)?.name === 'TimeoutError') {
                 throw new Error(`MCP timeout: ${method} (${timeout}ms)`);
             }
@@ -369,7 +440,12 @@ export class MCPServerProcess extends EventEmitter {
         }
         // session id 续约：initialize 响应总是覆盖写入（重握手后拿新 id）；其它响应仅在当前无 session 时补写。
         const sid = res.headers.get('mcp-session-id');
-        if (sid && (method === 'initialize' || !this.sessionId)) this.sessionId = sid;
+        if (
+            sid
+            && lifecycleGeneration === this.httpLifecycleGeneration
+            && !lifecycleSignal.aborted
+            && (method === 'initialize' || !this.sessionId)
+        ) this.sessionId = sid;
 
         if (!res.ok) {
             const errText = await res.text().catch(() => '');
@@ -382,16 +458,24 @@ export class MCPServerProcess extends EventEmitter {
                 || method === 'resources/list'
                 || method === 'prompts/list'
                 || method === 'ping';
-            if (sessionDead && safeToReplay && !_retried && !this.reHandshaking) {
+            if (sessionDead && safeToReplay && !_retried) {
                 try {
-                    await this.reinitHttp();
+                    const sessionAlreadyRotated = Boolean(
+                        this.sessionId
+                        && requestSessionId
+                        && this.sessionId !== requestSessionId,
+                    );
+                    if (!sessionAlreadyRotated) await this.reinitHttp();
                 } catch (reErr) {
-                    // 重握手都失败 → Broker 真挂了：如实置 error 并广播，别再谎报 running。
-                    this._status = 'error';
-                    this.emit('status-change', { name: this.name, status: 'error' });
+                    if (lifecycleGeneration === this.httpLifecycleGeneration && this._status === 'running') {
+                        this.transitionToError();
+                    }
                     throw new Error(`MCP http ${res.status} ${method}: re-handshake failed: ${(reErr as Error)?.message ?? reErr}`);
                 }
                 // 重握手成功 → 用新 session 重试本请求一轮（_retried=true 防无限重试）。
+                if (lifecycleGeneration !== this.httpLifecycleGeneration || this._status !== 'running') {
+                    throw new Error(`MCP http request cancelled: ${method}`);
+                }
                 return this.httpRequestOnce(method, params, timeout, true);
             }
             throw new Error(`MCP http ${res.status} ${method}: ${errText.slice(0, 200)}`);
@@ -413,11 +497,16 @@ export class MCPServerProcess extends EventEmitter {
         if (matched.error) {
             throw new Error(matched.error.message);
         }
+        if (lifecycleGeneration !== this.httpLifecycleGeneration || lifecycleSignal.aborted) {
+            throw new Error(`MCP http request cancelled: ${method}`);
+        }
         return matched.result;
     }
 
     /** 发一条无 id 的通知（HTTP POST，server 通常回 202 空 body）。 */
-    private async httpNotify(method: string, params?: unknown): Promise<void> {
+    private async httpNotify(method: string, params?: unknown, timeout = 5000): Promise<void> {
+        const lifecycleGeneration = this.httpLifecycleGeneration;
+        const lifecycleSignal = this.httpLifecycleAbortController.signal;
         const body = JSON.stringify({ jsonrpc: '2.0', method, params });
         let response: Response;
         try {
@@ -425,13 +514,19 @@ export class MCPServerProcess extends EventEmitter {
                 method: 'POST',
                 headers: this.httpHeaders(),
                 body,
-                signal: AbortSignal.timeout(5000),
+                signal: AbortSignal.any([lifecycleSignal, AbortSignal.timeout(timeout)]),
             });
         } catch (err) {
+            if (lifecycleSignal.aborted || lifecycleGeneration !== this.httpLifecycleGeneration) {
+                throw new Error(`MCP http notification cancelled: ${method}`);
+            }
             if ((err as Error)?.name === 'AbortError' || (err as Error)?.name === 'TimeoutError') {
-                throw new Error(`MCP timeout: ${method} (5000ms)`);
+                throw new Error(`MCP timeout: ${method} (${timeout}ms)`);
             }
             throw err;
+        }
+        if (lifecycleGeneration !== this.httpLifecycleGeneration || lifecycleSignal.aborted) {
+            throw new Error(`MCP http notification cancelled: ${method}`);
         }
         if (!response.ok) throw new Error(`MCP http ${response.status} ${method}`);
     }

@@ -44,7 +44,7 @@ const loadDOMPurify = () => (_dompurifyPromise ??= import('dompurify').then(m =>
 
 /** 从 mermaid 输出的 svg 字符串解析自然尺寸（优先 viewBox，退化 width/height 属性，兼容 px/%/pt 单位）。 */
 function parseSvgSize(svg: string): { w: number; h: number } | null {
-  const vb = svg.match(/viewBox="([\d.\-]+)\s+([\d.\-]+)\s+([\d.\-]+)\s+([\d.\-]+)"/);
+  const vb = svg.match(/viewBox="([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)"/);
   if (vb) {
     const w = parseFloat(vb[3]); const h = parseFloat(vb[4]);
     if (w > 0 && h > 0) return { w, h };

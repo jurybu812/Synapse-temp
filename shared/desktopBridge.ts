@@ -1,0 +1,1 @@
+export const DESKTOP_BRIDGE_PROTOCOL_VERSION = 2;

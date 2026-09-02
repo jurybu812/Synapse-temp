@@ -67,6 +67,7 @@ interface CatalogEntry {
 }
 
 export interface WindsurfLocalImportCandidate {
+    candidateFingerprint: string;
     source: string;
     accountLabel: string | null;
     apiServerUrl: string | null;
@@ -76,6 +77,7 @@ export interface WindsurfLocalImportError {
     code:
         | 'not_found'
         | 'multiple_accounts'
+        | 'candidate_selection_invalid'
         | 'database_locked'
         | 'database_corrupt'
         | 'invalid_credential'
@@ -186,6 +188,7 @@ function credentialFingerprint(apiKey: string): string {
 
 function candidateSummary(candidate: LocalCredentialMatch): WindsurfLocalImportCandidate {
     return {
+        candidateFingerprint: localCandidateFingerprint(candidate),
         source: candidate.source,
         accountLabel: candidate.credential.accountName ?? null,
         apiServerUrl: candidate.credential.apiServerUrl ?? null,
@@ -285,7 +288,8 @@ function localCandidateFingerprint(candidate: LocalCredentialMatch): string {
 }
 
 function importErrorMessage(code: WindsurfLocalImportError['code']): string {
-    if (code === 'multiple_accounts') return '发现多个本机 Devin/Windsurf 账号。为避免导错账号，请先在源客户端保留一个已登录账号后再导入。';
+    if (code === 'multiple_accounts') return '发现多个本机 Devin/Windsurf 账号。请选择要导入的账号，Synapse 不会自动决定。';
+    if (code === 'candidate_selection_invalid') return '所选本机账号已失效或不在最新扫描结果中，请重新选择。';
     if (code === 'database_locked') return 'Devin/Windsurf 的本机登录数据库正被占用，请关闭源客户端或稍后再试。';
     if (code === 'database_corrupt') return 'Devin/Windsurf 的本机登录数据库无法读取，可能已损坏或格式不是 SQLite。';
     if (code === 'invalid_credential') return '找到了 Devin/Windsurf 登录记录，但格式里没有可用的账号凭据。';
@@ -489,9 +493,11 @@ class WindsurfController {
         const credential = validateWindsurfCredential(getProviderCredential(PROVIDER_ID, CREDENTIAL_KIND));
         const storage = getProviderCredentialStatus(PROVIDER_ID);
         const rejection = getProviderCredentialRejection(PROVIDER_ID);
+        const activeTransaction = Boolean(this.transactionId)
+            && (this.state === 'waiting' || this.state === 'exchanging');
         return {
             providerId: PROVIDER_ID,
-            state: credential && !rejection ? 'connected' : rejection ? 'error' : this.state,
+            state: activeTransaction ? this.state : credential && !rejection ? 'connected' : rejection ? 'error' : this.state,
             connected: Boolean(credential) && !rejection,
             persisted: storage.persisted,
             storage: storage.storage,
@@ -500,7 +506,7 @@ class WindsurfController {
             transactionId: this.transactionId,
             expiresAt: this.expiresAt,
             credentialSource: credentialSourceFor(credential),
-            error: rejection?.message ?? this.error,
+            error: activeTransaction ? this.error : rejection?.message ?? this.error,
         };
     }
 
@@ -545,7 +551,7 @@ class WindsurfController {
         return task;
     }
 
-    async importLocal(options: { confirmationToken?: string; requesterId: number }): Promise<WindsurfLocalImportResult> {
+    async importLocal(options: { confirmationToken?: string; candidateFingerprint?: string; requesterId: number }): Promise<WindsurfLocalImportResult> {
         const statusBefore = await this.status();
         if (!safeStorage.isEncryptionAvailable()) {
             this.localImportConfirmation = null;
@@ -565,16 +571,27 @@ class WindsurfController {
                 : match);
         }
         const candidates = [...byFingerprint.values()];
+        const candidateSummaries = candidates.map(candidateSummary);
+        const requestedCandidateFingerprint = options.candidateFingerprint;
         if (candidates.length === 0) {
             this.localImportConfirmation = null;
+            if (requestedCandidateFingerprint !== undefined) {
+                return this.localImportError('candidate_selection_invalid', statusBefore, { candidates: candidateSummaries });
+            }
             const code = dominantIssue(issues);
             return this.localImportError(code, statusBefore);
         }
-        if (candidates.length > 1) {
+        if (requestedCandidateFingerprint === undefined && candidates.length > 1) {
             this.localImportConfirmation = null;
-            return this.localImportError('multiple_accounts', statusBefore, { candidates: candidates.map(candidateSummary) });
+            return this.localImportError('multiple_accounts', statusBefore, { candidates: candidateSummaries });
         }
-        const candidate = candidates[0];
+        const candidate = requestedCandidateFingerprint === undefined
+            ? candidates[0]
+            : candidates.find(match => localCandidateFingerprint(match) === requestedCandidateFingerprint);
+        if (!candidate) {
+            this.localImportConfirmation = null;
+            return this.localImportError('candidate_selection_invalid', statusBefore, { candidates: candidateSummaries });
+        }
         const current = validateWindsurfCredential(getProviderCredential(PROVIDER_ID, CREDENTIAL_KIND));
         const currentStatus = getProviderCredentialStatus(PROVIDER_ID);
         const currentRejection = getProviderCredentialRejection(PROVIDER_ID);
@@ -605,6 +622,7 @@ class WindsurfController {
             const confirmationValid = Boolean(confirmation
                 && confirmation.token === options.confirmationToken
                 && confirmation.requesterId === options.requesterId
+                && options.candidateFingerprint === candidateFingerprint
                 && confirmation.candidateFingerprint === candidateFingerprint
                 && confirmation.currentAccountFingerprint === currentStatus.accountFingerprint
                 && confirmation.currentCredentialGeneration === currentStatus.credentialGeneration

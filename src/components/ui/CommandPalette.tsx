@@ -7,7 +7,7 @@ interface Command {
   category: string;
   shortcut?: string;
   icon?: React.ElementType;
-  action: () => void;
+  action: () => void | Promise<void>;
 }
 
 interface CommandPaletteProps {

@@ -130,15 +130,27 @@ const { groupFileDiffs, normalizeDiffPath, reviewPathKeys } = groupModule.export
 
 {
   const diffs = [
-    { id: 'batch-1', path: 'C:/Repo/Project/test/planner.test.js', reviewPath: 'test/planner.test.js', status: 'pending', contextId: 'run-a', conversationId: 'autosave-current', additions: 48, deletions: 0 },
-    { id: 'batch-2', path: 'C:\\Repo\\Project\\test\\planner.test.js', reviewPath: 'test/planner.test.js', status: 'pending', contextId: 'run-b', conversationId: 'conv-promoted', additions: 44, deletions: 1 },
-    { id: 'batch-3', path: 'TEST/PLANNER.TEST.JS', reviewPath: 'test/planner.test.js', status: 'pending', contextId: 'subagent-c', conversationId: 'conv-promoted', additions: 159, deletions: 4 },
+    { id: 'batch-1', path: 'C:/Repo/Project/test/planner.test.js', reviewPath: 'test/planner.test.js', workspaceRoot, status: 'pending', contextId: 'run-a', conversationId: 'autosave-current', additions: 48, deletions: 0 },
+    { id: 'batch-2', path: 'C:\\Repo\\Project\\test\\planner.test.js', reviewPath: 'test/planner.test.js', workspaceRoot: 'C:\\Repo\\Project', status: 'pending', contextId: 'run-b', conversationId: 'conv-promoted', additions: 44, deletions: 1 },
+    { id: 'batch-3', path: 'TEST/PLANNER.TEST.JS', reviewPath: 'test/planner.test.js', workspaceRoot: 'C:/Repo/Project', status: 'pending', contextId: 'subagent-c', conversationId: 'conv-promoted', additions: 159, deletions: 4 },
     { id: 'other-file', path: 'src/planner.js', status: 'pending', contextId: 'run-b', conversationId: 'conv-promoted', additions: 5, deletions: 2 },
   ];
   const groups = groupFileDiffs(diffs, {});
   assert.equal(groups.length, 2);
-  assert.equal(groups.find(group => group.key === 'test/planner.test.js').activeDiffs.length, 3);
+  assert.equal(groups.find(group => group.path === 'test/planner.test.js').activeDiffs.length, 3);
   assert.equal(groups.find(group => group.key === 'src/planner.js').activeDiffs.length, 1);
+}
+
+{
+  const diffs = [
+    { id: 'workspace-a', path: 'C:/Repo/A/src/same.ts', reviewPath: 'src/same.ts', status: 'pending', additions: 1, deletions: 0 },
+    { id: 'workspace-b', path: 'C:/Repo/B/src/same.ts', reviewPath: 'src/same.ts', status: 'pending', additions: 1, deletions: 0 },
+    { id: 'workspace-a-next', path: 'C:/Repo/A/src/same.ts', reviewPath: 'src/same.ts', workspaceRoot: 'C:/Repo/A', status: 'pending', additions: 2, deletions: 1 },
+  ];
+  const groups = groupFileDiffs(diffs, {});
+  assert.equal(groups.length, 2, 'same relative path in different workspace roots must not merge');
+  assert.equal(groups.find(group => group.activeDiffs.some(diff => diff.id === 'workspace-a')).activeDiffs.length, 2);
+  assert.equal(groups.find(group => group.activeDiffs.some(diff => diff.id === 'workspace-b')).activeDiffs.length, 1);
 }
 
 const pathReviewChecks = Promise.all([
@@ -163,6 +175,7 @@ const conversation = compileTypeScript(
     '@reduxjs/toolkit': require('@reduxjs/toolkit'),
     '@/services/fileChangeTracker': fileChangeTracker,
     '@/services/diffReviewLedger': { findMergeableMessageDiffIndex },
+    '@/services/diffReviewPath': diffReviewPath,
     '@/services/conversationPersistence': { AUTOSAVE_ID: 'autosave-current' },
   },
 );
@@ -171,6 +184,7 @@ const {
   setConversation,
   updateDiffStatus,
   updateHunkStatus,
+  supersedeDiffsForPaths,
 } = conversation;
 class FileWriteConflictError extends Error {
   constructor(message, currentContent) {
@@ -181,6 +195,7 @@ class FileWriteConflictError extends Error {
 }
 const reviewDisk = new Map();
 let mutateBeforeNextReviewWrite = null;
+let mutateBeforeNextReviewDelete = null;
 const normalizeReviewDiskPath = value => normalizeDiffPath(canonicalWinPath(value));
 const reviewFileSystem = {
   hasNode(filePath) {
@@ -210,8 +225,20 @@ const reviewFileSystem = {
     }
     reviewDisk.set(key, content);
   },
-  async deleteFile(filePath) {
-    reviewDisk.delete(normalizeReviewDiskPath(filePath));
+  async deleteFile(filePath, _contextId, _conversationId, _access, options) {
+    const key = normalizeReviewDiskPath(filePath);
+    if (mutateBeforeNextReviewDelete) {
+      const mutate = mutateBeforeNextReviewDelete;
+      mutateBeforeNextReviewDelete = null;
+      mutate(key);
+    }
+    if (options && Object.prototype.hasOwnProperty.call(options, 'expectedContent')) {
+      const currentContent = reviewDisk.has(key) ? reviewDisk.get(key) : null;
+      if (currentContent !== options.expectedContent) {
+        throw new FileWriteConflictError('文件已在删除前被其它操作修改', currentContent);
+      }
+    }
+    reviewDisk.delete(key);
   },
 };
 const fileRollback = compileTypeScript(
@@ -320,13 +347,25 @@ const rejectConflictChecks = (async () => {
   const createdContent = 'agent-created-content';
   const created = lifecycleDiff('created-delete-conflict', createdPath, 'created', '', createdContent);
   reviewDisk.set(createdKey, createdContent);
-  mutateBeforeNextReviewWrite = key => reviewDisk.set(key, 'external-created-change');
+  mutateBeforeNextReviewDelete = key => reviewDisk.set(key, 'external-created-change');
   await assert.rejects(
     () => fileRollback.applyDiffReview(created, undefined, 'rejected'),
-    /文件已在保存前被其它操作修改|文件在删除前又被修改/,
-    'created-file reject must fail closed before final delete when the file changes',
+    /文件已在删除前被其它操作修改|文件在删除前又被修改/,
+    'created-file reject must fail closed during guarded delete when the file changes after preflight',
   );
   assert.equal(reviewDisk.get(createdKey), 'external-created-change', 'created-file reject must not delete an external change');
+
+  const rollbackPath = 'C:/Repo/Project/src/rollback-created-delete-conflict.txt';
+  const rollbackKey = normalizeReviewDiskPath(rollbackPath);
+  const rollbackCreated = lifecycleDiff('rollback-created-delete-conflict', rollbackPath, 'created', '', createdContent);
+  reviewDisk.set(rollbackKey, createdContent);
+  mutateBeforeNextReviewDelete = key => reviewDisk.set(key, 'external-rollback-created-change');
+  await assert.rejects(
+    () => fileRollback.rollbackFileDiffsAtomically([{ diff: rollbackCreated }]),
+    /文件已在删除前被其它操作修改/,
+    'atomic rollback of created files must use guarded delete and fail closed on a delete race',
+  );
+  assert.equal(reviewDisk.get(rollbackKey), 'external-rollback-created-change', 'rollback delete must preserve the external change');
 })();
 
 {
@@ -530,6 +569,51 @@ function messageDiff(state, diffId) {
     status: 'mixed',
     hunks: [{ status: 'mixed', blocks: [{ status: 'accepted' }, { status: 'pending' }] }],
   }), true);
+  assert.equal(hasPendingReviewParts({
+    status: 'superseded',
+    hunks: [{ status: 'pending', blocks: [{ status: 'pending' }] }],
+  }), false);
+}
+
+{
+  const staleFile = {
+    id: 'stale-delete-file',
+    path: 'C:/Repo/Project/src/stale.ts',
+    reviewPath: 'src/stale.ts',
+    workspaceRoot,
+    changeType: 'edited',
+    additions: 1,
+    deletions: 1,
+    status: 'pending',
+    hunks: [],
+  };
+  const staleNested = {
+    ...staleFile,
+    id: 'stale-delete-nested',
+    path: 'C:/Repo/Project/src/nested/stale.ts',
+    reviewPath: 'src/nested/stale.ts',
+  };
+  const untouched = {
+    ...staleFile,
+    id: 'stale-other-workspace',
+    path: 'C:/Repo/Other/src/stale.ts',
+    reviewPath: 'src/stale.ts',
+    workspaceRoot: 'C:/Repo/Other',
+  };
+  const state = conversationSlice.reducer(
+    stateWithDiffs([staleFile, staleNested, untouched]),
+    supersedeDiffsForPaths({
+      paths: ['C:/Repo/Project/src'],
+      includeDescendants: true,
+      conversationId: 'conv-empty-review',
+      reason: 'deleted in file tree',
+    }),
+  );
+  assert.equal(stateDiff(state, 'stale-delete-file').status, 'superseded');
+  assert.equal(stateDiff(state, 'stale-delete-nested').status, 'superseded');
+  assert.equal(messageDiff(state, 'stale-delete-file').status, 'superseded');
+  assert.equal(hasPendingReviewParts(stateDiff(state, 'stale-delete-file')), false);
+  assert.equal(stateDiff(state, 'stale-other-workspace').status, 'pending');
 }
 
 Promise.all([pathReviewChecks, emptyLifecycleChecks, rejectConflictChecks])

@@ -6,8 +6,9 @@ export interface ChatScrollCheckpoint {
   visibleUnitStart: number;
   visibleUnitEnd: number;
   anchor?: {
-    kind: 'message' | 'boundary';
+    kind: 'message' | 'boundary' | 'step';
     id?: string;
+    boundaryId?: string;
     offset: number;
   };
   updatedAt: number;
@@ -29,6 +30,38 @@ const SESSION_CHECKPOINT_KEY = 'synapse:agent-session-checkpoint:v1';
 const LEGACY_ACTIVE_CONVERSATION_KEY = 'synapse_active_conversation_id';
 const TAB_SCROLL_STORAGE_PREFIX = 'synapse:agent-tab-scroll:';
 const AUTOSAVE_CONVERSATION_ID = 'autosave-current';
+const MIN_ANCHOR_OFFSET_VIEWPORT_BAND_PX = 240;
+
+function safeViewportHeight(value: number): number {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function anchorOffsetViewportBand(viewportHeight: number): number {
+  return Math.max(MIN_ANCHOR_OFFSET_VIEWPORT_BAND_PX, safeViewportHeight(viewportHeight));
+}
+
+export function clampChatScrollAnchorOffset(offset: unknown, viewportHeight: number): number {
+  const value = Number(offset);
+  if (!Number.isFinite(value)) return 0;
+  const height = safeViewportHeight(viewportHeight);
+  const band = anchorOffsetViewportBand(height);
+  return Math.max(-band, Math.min(height + band, value));
+}
+
+export function isChatScrollAnchorOffsetWithinViewportBand(offset: unknown, viewportHeight: number): boolean {
+  const value = Number(offset);
+  if (!Number.isFinite(value)) return false;
+  return Math.abs(value - clampChatScrollAnchorOffset(value, viewportHeight)) <= 0.5;
+}
+
+export function clampChatScrollTopForRestore(scrollTop: unknown, scrollHeight: number, clientHeight: number): number {
+  const value = Number(scrollTop);
+  if (!Number.isFinite(value)) return 0;
+  const height = Number.isFinite(scrollHeight) && scrollHeight > 0 ? scrollHeight : 0;
+  const viewportHeight = safeViewportHeight(clientHeight);
+  const maxScrollTop = Math.max(0, height - viewportHeight);
+  return Math.max(0, Math.min(maxScrollTop, value));
+}
 
 function normalizeAgentPanelTab(value: unknown): AgentPanelTab {
   return value === 'plan' || value === 'context' ? value : 'chat';
@@ -165,8 +198,9 @@ export function writeAgentSessionViewport(input: {
   } catch {
     selectedConversationId = readAgentSessionCheckpoint()?.activeConversationId ?? null;
   }
-  if (selectedConversationId && selectedConversationId !== input.conversationId) return;
   const current = readAgentSessionCheckpoint();
+  const activeConversationId = selectedConversationId ?? current?.activeConversationId ?? null;
+  if (activeConversationId && activeConversationId !== input.conversationId) return;
   const chatScroll = input.chatScroll
     ? { ...input.chatScroll, conversationId: input.conversationId }
     : current?.chatScroll?.conversationId === input.conversationId
@@ -176,7 +210,7 @@ export function writeAgentSessionViewport(input: {
     version: 1,
     activeConversationId: input.conversationId === AUTOSAVE_CONVERSATION_ID
       ? null
-      : selectedConversationId || input.conversationId,
+      : activeConversationId || input.conversationId,
     activeAgentTab: input.activeAgentTab,
     chatScroll,
     tabScroll: {
@@ -194,8 +228,14 @@ export function promoteAgentSessionCheckpoint(fromId: string, toId: string) {
   if (!fromId || !toId || fromId === toId) return;
   const current = readAgentSessionCheckpoint();
   if (current) {
+    const promotesAutosaveViewport = fromId === AUTOSAVE_CONVERSATION_ID
+      && current.activeConversationId === null
+      && (current.chatScroll?.conversationId === fromId || current.tabScroll?.conversationId === fromId);
     writeCheckpoint({
       ...current,
+      activeConversationId: current.activeConversationId === fromId || promotesAutosaveViewport
+        ? toId
+        : current.activeConversationId,
       chatScroll: current.chatScroll?.conversationId === fromId
         ? { ...current.chatScroll, conversationId: toId }
         : current.chatScroll,
@@ -206,6 +246,11 @@ export function promoteAgentSessionCheckpoint(fromId: string, toId: string) {
     });
   }
   try {
+    const legacyActiveConversationId = localStorage.getItem(LEGACY_ACTIVE_CONVERSATION_KEY);
+    if (legacyActiveConversationId === fromId
+      || (fromId === AUTOSAVE_CONVERSATION_ID && legacyActiveConversationId === null)) {
+      localStorage.setItem(LEGACY_ACTIVE_CONVERSATION_KEY, toId);
+    }
     const sourceTabScrollKey = `${TAB_SCROLL_STORAGE_PREFIX}${fromId}`;
     const targetTabScrollKey = `${TAB_SCROLL_STORAGE_PREFIX}${toId}`;
     const sourceTabScroll = localStorage.getItem(sourceTabScrollKey);

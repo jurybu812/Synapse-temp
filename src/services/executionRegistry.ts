@@ -22,7 +22,42 @@ interface CancelableEntry {
   runId?: string;
 }
 
+export interface StopAuditSnapshot {
+  ownerId: string;
+  ownerIds: string[];
+  startedAt: number;
+  finishedAt: number;
+  cancelledCount: number;
+  passes: number;
+  timedOut: boolean;
+  timedOutCancellations: number;
+  lateCancellations: number;
+  exhaustedPasses: boolean;
+  toolTaskTimedOut: boolean;
+  toolTaskTimeoutPhase?: 'list' | 'cancel';
+  toolTaskTimeoutCount: number;
+}
+
+interface TrackedStopPromise {
+  promise: Promise<unknown>;
+  settled: boolean;
+}
+
+interface StopWaitResult {
+  timedOut: boolean;
+  pendingCount: number;
+}
+
+type BoundedWaitResult<T> =
+  | { status: 'settled'; value: T }
+  | { status: 'rejected'; error: unknown }
+  | { status: 'timeout' };
+
 const OWNER_STORAGE_KEY = 'synapse_execution_owners_v1';
+const STOP_CANCEL_SETTLE_TIMEOUT_MS = 750;
+const STOP_TOOL_TASK_SETTLE_TIMEOUT_MS = 750;
+const STOP_STABLE_PASSES = 2;
+const STOP_MAX_PASSES = 6;
 
 class ExecutionRegistry {
   private readonly slotsByOwner = new Map<string, ExecutionSlot>();
@@ -34,7 +69,8 @@ class ExecutionRegistry {
   private readonly activeRunByOwner = new Map<string, string>();
   private readonly stoppingOwners = new Set<string>();
   private readonly stopOperations = new Map<string, Promise<number>>();
-  private readonly lateCancellationsByOwner = new Map<string, Set<Promise<void>>>();
+  private readonly lateCancellationsByOwner = new Map<string, Set<Promise<unknown>>>();
+  private readonly stopAuditsByOwner = new Map<string, StopAuditSnapshot>();
 
   getOrCreateLoop<TLoop extends RegisteredAgentLoop>(
     conversationId: string,
@@ -64,6 +100,12 @@ class ExecutionRegistry {
 
   getOwnerId(conversationId: string): string | null {
     return this.ownerForConversation(conversationId);
+  }
+
+  isConversationRunning(conversationId: string): boolean {
+    const ownerId = this.ownerForConversation(conversationId);
+    if (ownerId && this.activeRunByOwner.has(ownerId)) return true;
+    return this.getLoop(conversationId)?.isRunning === true;
   }
 
   restoreOwnerForConversation(conversationId: string, ownerId: string): boolean {
@@ -165,13 +207,22 @@ class ExecutionRegistry {
   async cancelOwner(ownerId: string): Promise<number> {
     const existing = this.stopOperations.get(ownerId);
     if (existing) return existing;
+    const startedAt = Date.now();
     const operation = (async () => {
       let total = 0;
       let stablePasses = 0;
-      while (stablePasses < 2) {
+      let passes = 0;
+      let timedOutCancellations = 0;
+      let lastOwners = [ownerId];
+      while (stablePasses < STOP_STABLE_PASSES && passes < STOP_MAX_PASSES) {
+        passes += 1;
         const owners = this.collectOwnerTree(ownerId);
-        for (const targetOwnerId of owners) this.stoppingOwners.add(targetOwnerId);
-        const pending: Promise<unknown>[] = [];
+        lastOwners = owners;
+        for (const targetOwnerId of owners) {
+          this.stoppingOwners.add(targetOwnerId);
+          this.activeRunByOwner.delete(targetOwnerId);
+        }
+        const pending: TrackedStopPromise[] = [];
         let foundWork = false;
         for (const targetOwnerId of owners) {
           const ownerTasks = this.cancellablesByOwner.get(targetOwnerId);
@@ -180,25 +231,37 @@ class ExecutionRegistry {
             const cancellations = [...ownerTasks.values()];
             total += cancellations.length;
             foundWork = true;
-            pending.push(...cancellations.map(entry => Promise.resolve().then(entry.cancel)));
-          }
-          const late = this.lateCancellationsByOwner.get(targetOwnerId);
-          if (late?.size) {
-            foundWork = true;
-            pending.push(...late);
+            pending.push(...cancellations.map(entry => this.invokeCancellation(entry.cancel)));
           }
         }
-        if (pending.length) await Promise.allSettled(pending);
+        const waitResult = await this.waitForTrackedCancellations(pending, STOP_CANCEL_SETTLE_TIMEOUT_MS);
+        if (waitResult.timedOut) timedOutCancellations += waitResult.pendingCount;
         await Promise.resolve();
         const nextOwners = this.collectOwnerTree(ownerId);
         const hasNewWork = nextOwners.some(targetOwnerId =>
-          (this.cancellablesByOwner.get(targetOwnerId)?.size ?? 0) > 0
-          || (this.lateCancellationsByOwner.get(targetOwnerId)?.size ?? 0) > 0,
+          (this.cancellablesByOwner.get(targetOwnerId)?.size ?? 0) > 0,
         );
         stablePasses = !foundWork && !hasNewWork && nextOwners.length === owners.length
           ? stablePasses + 1
           : 0;
       }
+      const exhaustedPasses = stablePasses < STOP_STABLE_PASSES;
+      const audit: StopAuditSnapshot = {
+        ownerId,
+        ownerIds: lastOwners,
+        startedAt,
+        finishedAt: Date.now(),
+        cancelledCount: total,
+        passes,
+        timedOut: timedOutCancellations > 0 || exhaustedPasses,
+        timedOutCancellations,
+        lateCancellations: this.countLateCancellations(lastOwners),
+        exhaustedPasses,
+        toolTaskTimedOut: false,
+        toolTaskTimeoutCount: 0,
+      };
+      this.stopAuditsByOwner.set(ownerId, audit);
+      if (audit.timedOut) this.warnStopTimeout(audit);
       return total;
     })();
     this.stopOperations.set(ownerId, operation);
@@ -207,6 +270,11 @@ class ExecutionRegistry {
     } finally {
       this.stopOperations.delete(ownerId);
     }
+  }
+
+  getLastStopAudit(ownerId: string): StopAuditSnapshot | null {
+    const audit = this.stopAuditsByOwner.get(ownerId);
+    return audit ? { ...audit, ownerIds: [...audit.ownerIds] } : null;
   }
 
   private collectOwnerTree(ownerId: string): string[] {
@@ -224,21 +292,98 @@ class ExecutionRegistry {
   }
 
   private trackLateCancellation(ownerId: string, cancel: () => void | Promise<void>): void {
-    try {
-      this.trackLatePromise(ownerId, Promise.resolve(cancel()));
-    } catch {
-      this.trackLatePromise(ownerId, Promise.resolve());
-    }
+    this.trackLatePromise(ownerId, this.invokeCancellation(cancel).promise);
   }
 
-  private trackLatePromise(ownerId: string, promise: Promise<void>): void {
-    const pending = this.lateCancellationsByOwner.get(ownerId) ?? new Set<Promise<void>>();
+  private trackLatePromise(ownerId: string, promise: Promise<unknown>): void {
+    const pending = this.lateCancellationsByOwner.get(ownerId) ?? new Set<Promise<unknown>>();
     pending.add(promise);
     this.lateCancellationsByOwner.set(ownerId, pending);
     void promise.finally(() => {
       pending.delete(promise);
       if (pending.size === 0) this.lateCancellationsByOwner.delete(ownerId);
     }).catch(() => undefined);
+  }
+
+  private invokeCancellation(cancel: () => void | Promise<void>): TrackedStopPromise {
+    const tracked: TrackedStopPromise = { promise: Promise.resolve(), settled: false };
+    tracked.promise = Promise.resolve()
+      .then(cancel)
+      .catch(() => undefined)
+      .finally(() => {
+        tracked.settled = true;
+      });
+    return tracked;
+  }
+
+  private async waitForTrackedCancellations(
+    pending: TrackedStopPromise[],
+    timeoutMs: number,
+  ): Promise<StopWaitResult> {
+    if (pending.length === 0) return { timedOut: false, pendingCount: 0 };
+    const result = await this.waitBounded(
+      Promise.all(pending.map(item => item.promise)),
+      timeoutMs,
+    );
+    const pendingCount = pending.filter(item => !item.settled).length;
+    return {
+      timedOut: result.status === 'timeout' && pendingCount > 0,
+      pendingCount,
+    };
+  }
+
+  private async waitBounded<T>(promise: Promise<T>, timeoutMs: number): Promise<BoundedWaitResult<T>> {
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const guarded: Promise<BoundedWaitResult<T>> = promise
+      .then(value => ({ status: 'settled' as const, value }))
+      .catch(error => ({ status: 'rejected' as const, error }));
+    const timeout = new Promise<BoundedWaitResult<T>>(resolve => {
+      timeoutId = setTimeout(() => resolve({ status: 'timeout' }), timeoutMs);
+    });
+    const result = await Promise.race([guarded, timeout]);
+    if (timeoutId) clearTimeout(timeoutId);
+    return result;
+  }
+
+  private countLateCancellations(ownerIds: string[]): number {
+    return ownerIds.reduce(
+      (total, ownerId) => total + (this.lateCancellationsByOwner.get(ownerId)?.size ?? 0),
+      0,
+    );
+  }
+
+  private recordToolTaskStopTimeout(
+    ownerId: string,
+    phase: 'list' | 'cancel',
+    timeoutCount: number,
+  ): void {
+    const current = this.stopAuditsByOwner.get(ownerId);
+    if (!current) return;
+    const next = {
+      ...current,
+      finishedAt: Date.now(),
+      timedOut: true,
+      toolTaskTimedOut: true,
+      toolTaskTimeoutPhase: phase,
+      toolTaskTimeoutCount: timeoutCount,
+    };
+    this.stopAuditsByOwner.set(ownerId, next);
+    this.warnStopTimeout(next);
+  }
+
+  private warnStopTimeout(audit: StopAuditSnapshot): void {
+    if (typeof console === 'undefined' || typeof console.warn !== 'function') return;
+    console.warn('[Synapse] Stop cancellation did not fully settle before timeout', {
+      ownerId: audit.ownerId,
+      ownerIds: audit.ownerIds,
+      cancelledCount: audit.cancelledCount,
+      timedOutCancellations: audit.timedOutCancellations,
+      lateCancellations: audit.lateCancellations,
+      exhaustedPasses: audit.exhaustedPasses,
+      toolTaskTimedOut: audit.toolTaskTimedOut,
+      toolTaskTimeoutPhase: audit.toolTaskTimeoutPhase,
+      toolTaskTimeoutCount: audit.toolTaskTimeoutCount,
+    });
   }
 
   resolveConversationId(context: Pick<ExecutionContext, 'ownerId' | 'conversationId'>): string {
@@ -276,10 +421,27 @@ class ExecutionRegistry {
     const toolTask = typeof window !== 'undefined' ? window.synapse?.toolTask : undefined;
     if (ownerId && toolTask?.list) {
       try {
-        const snapshots = await toolTask.list({ conversationId, ownerId });
-        await Promise.allSettled(snapshots
+        const snapshotsResult = await this.waitBounded(
+          toolTask.list({ conversationId, ownerId }),
+          STOP_TOOL_TASK_SETTLE_TIMEOUT_MS,
+        );
+        if (snapshotsResult.status === 'timeout') {
+          this.recordToolTaskStopTimeout(ownerId, 'list', 1);
+          return true;
+        }
+        if (snapshotsResult.status === 'rejected') throw snapshotsResult.error;
+        const cancellations = snapshotsResult.value
           .filter(snapshot => snapshot.status === 'running' || snapshot.status === 'cancelling')
-          .map(snapshot => toolTask.cancel(snapshot.taskId, { conversationId, ownerId })));
+          .map(snapshot => Promise.resolve().then(() => toolTask.cancel(snapshot.taskId, { conversationId, ownerId })));
+        const cancelResult = await this.waitBounded(
+          Promise.allSettled(cancellations),
+          STOP_TOOL_TASK_SETTLE_TIMEOUT_MS,
+        );
+        if (cancelResult.status === 'timeout') {
+          this.recordToolTaskStopTimeout(ownerId, 'cancel', cancellations.length);
+          return true;
+        }
+        if (cancelResult.status === 'rejected') throw cancelResult.error;
       } catch {
         // Stop 的本地复位不能被后台任务对账失败阻塞；未知任务会在工具卡重载对账时显式呈现。
       }

@@ -78,8 +78,21 @@ assert(
   'preload must wire renderer MCP calls to the existing main-process IPC channels',
 );
 
+const startBlock = sliceHandler(mcp, 'mcp:start');
 assertOrder(
-  sliceHandler(mcp, 'mcp:start'),
+  startBlock,
+  'const generation = advanceLifecycleGeneration(name);',
+  "await confirmMCPLifecycleChange(event.sender, 'start', name);",
+  'mcp:start intent cancellation',
+);
+assertOrder(
+  startBlock,
+  "await confirmMCPLifecycleChange(event.sender, 'start', name);",
+  'assertLifecycleGeneration(name, generation);',
+  'mcp:start approval generation validation',
+);
+assertOrder(
+  startBlock,
   "await confirmMCPLifecycleChange(event.sender, 'start', name);",
   'await proc.start();',
   'mcp:start',
@@ -129,8 +142,60 @@ assert(
   'mcp status must return reusable tool definitions so renderer refresh does not list every server twice',
 );
 assert(
-  (mcp.match(/new Map\(listedTools\.map\(tool => \[tool\.name, tool\]\)\)/g) || []).length === 2,
-  'mcp status must deduplicate configured and runtime-only tool definitions by name',
+  (mcp.match(/new Map\(listedTools\.map\(tool => \[tool\.name, tool\]\)\)/g) || []).length === 1,
+  'shared MCP status projection must deduplicate tool definitions by name',
+);
+assert(
+  mcp.includes('const lifecycleOperations = new Map<string, Promise<unknown>>()')
+  && (mcp.match(/return withServerLifecycle\(name, async \(\) => \{/g) || []).length === 2,
+  'MCP start and restart must serialize per server name',
+);
+const stopBlock = sliceHandler(mcp, 'mcp:stop');
+assert(!stopBlock.includes('withServerLifecycle'), 'MCP stop must cancel immediately instead of queueing behind start');
+assertOrder(stopBlock, 'advanceLifecycleGeneration(name);', 'await proc.stop();', 'mcp:stop generation cancellation');
+assert(
+  mcp.includes('function removeServerIfCurrent(name: string, proc: MCPServerProcess)')
+  && (mcp.match(/removeServerIfCurrent\(name, /g) || []).length >= 6,
+  'late cleanup must only remove the process instance that is still current',
+);
+assert(
+  mcp.includes('const configuredServers = await Promise.all(')
+  && mcp.includes('const unconfiguredServers = await Promise.all('),
+  'MCP status must query independent servers concurrently',
+);
+
+const processSource = read('electron/mcp/MCPServerProcess.ts');
+assert(
+  processSource.includes('private httpLifecycleGeneration = 0')
+  && processSource.includes('generation !== this.httpLifecycleGeneration')
+  && processSource.includes('this.httpLifecycleGeneration += 1;'),
+  'HTTP MCP start must not revive after a later stop',
+);
+assert(
+  processSource.includes('private stdioStartPromise: Promise<void> | null = null')
+  && processSource.includes('private stdioLifecycleGeneration = 0')
+  && processSource.includes('MCP stdio start cancelled:'),
+  'stdio MCP concurrent starts must join one lifecycle generation and Stop must cancel it',
+);
+assert(
+  processSource.includes('private httpReinitPromise: Promise<void> | null = null')
+  && !processSource.includes('private reHandshaking = false'),
+  'HTTP session re-initialization must use a joinable single-flight promise',
+);
+assert(
+  processSource.includes("if (this._status === 'running') this.transitionToError();")
+  && processSource.includes("this.emit('status-change', { name: this.name, status: 'error' })"),
+  'listTools transport failure must transition the visible server status to error',
+);
+assert(
+  processSource.includes("if (this._status !== 'running') throw new Error(`MCP http server is not running: ${this.name}`)")
+  && processSource.includes('MCP http request cancelled:'),
+  'HTTP MCP re-handshake and late request results must stop at the current lifecycle generation',
+);
+assert(
+  processSource.includes("}, this.initializeTimeoutMs);")
+  && processSource.includes("this.httpNotify('notifications/initialized', undefined, this.initializeTimeoutMs)"),
+  'HTTP MCP initialize and initialized notification must share the configured startup timeout',
 );
 
 for (const [label, source] of [['preload', preload], ['platform', platform]]) {

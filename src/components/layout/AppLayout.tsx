@@ -9,16 +9,30 @@ import { ToastContainer } from '@/components/ui/Toast';
 import { CommandPalette, useDefaultCommands } from '@/components/ui/CommandPalette';
 import { QuickOpen } from '@/components/ui/QuickOpen';
 import { PanelRightOpen } from 'lucide-react';
-import { openTab } from '@/store/slices/editorTabs';
+import { openTab, resetTabsToWelcome } from '@/store/slices/editorTabs';
+import { openWorkspace } from '@/store/slices/workspace';
+import { selectActiveConversation } from '@/store/slices/conversation';
 import { useShortcuts } from '@/hooks/useShortcuts';
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { useAppDispatch, useAppSelector } from '@/store/hooks';
 import { toggleAgentPanel, toggleSidebar, setSidebarVisible } from '@/store/slices/layout';
 import { setActiveView } from '@/store/slices/sidebar';
 import { setThemeMode } from '@/store/slices/theme';
 import { addNotification } from '@/store/slices/notifications';
 import { resolveEditorType } from '@/services/editorFileTypes';
+import { fileSystem, type Workspace } from '@/services/fileSystem';
+import { resolveUnsavedTabs } from '@/services/unsavedChanges';
+import {
+  getWorkspaceChangeBlockState,
+  tryBeginWorkspacePickerPending,
+  workspaceChangeBlockMessage,
+} from '@/services/workspacePickerCoordinator';
+import { isElectron } from '@platform/index';
 import type { RootState } from '@/store';
+
+function workspacePathKey(workspacePath: string | null | undefined): string {
+  return (workspacePath ?? '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLocaleLowerCase();
+}
 
 export function AppLayout() {
   const dispatch = useAppDispatch();
@@ -26,8 +40,24 @@ export function AppLayout() {
   const agentPanelVisible = useAppSelector((s: RootState) => s.layout.agentPanelVisible);
   const activeView = useAppSelector((s: RootState) => s.sidebar.activeView);
   const themeMode = useAppSelector((s: RootState) => s.theme.mode);
+  const tabs = useAppSelector((s: RootState) => s.editorTabs.tabs);
+  const currentWorkspacePath = useAppSelector((s: RootState) => s.workspace.currentPath);
+  const activeConversation = useAppSelector(selectActiveConversation);
+  const notifyWorkspaceChangeBlocked = useCallback(() => {
+    const blockState = getWorkspaceChangeBlockState(activeConversation);
+    if (!blockState.blocked) return false;
+    dispatch(addNotification({
+      type: 'warning',
+      title: '当前任务仍在运行',
+      message: workspaceChangeBlockMessage(blockState),
+    }));
+    return true;
+  }, [activeConversation, dispatch]);
   const [cmdPaletteOpen, setCmdPaletteOpen] = useState(false);
   const [quickOpenOpen, setQuickOpenOpen] = useState(false);
+  const workspacePickerPendingRef = useRef(false);
+  const workspacePathRef = useRef<string | null>(currentWorkspacePath);
+  workspacePathRef.current = currentWorkspacePath;
   const sidebarPanelRef = usePanelRef();
   const bottomPanelRef = usePanelRef();
   const agentPanelRef = usePanelRef();
@@ -72,13 +102,68 @@ export function AppLayout() {
     }
   }, [activeView, sidebarVisible, dispatch]);
 
+  const handleOpenWorkspace = useCallback(async () => {
+    if (workspacePickerPendingRef.current) return;
+    if (notifyWorkspaceChangeBlocked()) return;
+    workspacePickerPendingRef.current = true;
+    try {
+      const ok = await resolveUnsavedTabs(tabs, '打开工作区');
+      if (!ok) return;
+
+      if (!isElectron || !window.synapse?.workspace) {
+        dispatch(setActiveView('explorer'));
+        dispatch(setSidebarVisible(true));
+        dispatch(addNotification({ type: 'warning', title: '打开工作区', message: '当前模式请从欢迎页导入工作区' }));
+        return;
+      }
+
+      const finishWorkspacePickerPending = tryBeginWorkspacePickerPending();
+      if (!finishWorkspacePickerPending) return;
+      try {
+        const workspaceIntent = fileSystem.beginWorkspaceIntent();
+        const startedWorkspacePath = workspacePathRef.current;
+        const workspace: { id: string; name: string; path: string } | null = await window.synapse.workspace.open();
+        if (!workspace) return;
+        if (
+          !fileSystem.isWorkspaceIntentCurrent(workspaceIntent)
+          || workspacePathKey(workspacePathRef.current) !== workspacePathKey(startedWorkspacePath)
+        ) return;
+
+        const localWorkspace: Workspace = {
+          id: workspace.id,
+          name: workspace.name || workspace.path,
+          path: workspace.path,
+          lastOpened: Date.now(),
+        };
+        fileSystem.openExternalWorkspace(localWorkspace);
+        dispatch(resetTabsToWelcome());
+        dispatch(openWorkspace({ path: localWorkspace.path, name: localWorkspace.name }));
+        dispatch(setActiveView('explorer'));
+        dispatch(setSidebarVisible(true));
+        dispatch(addNotification({ type: 'success', title: '打开工作区', message: localWorkspace.name }));
+      } finally {
+        finishWorkspacePickerPending();
+      }
+    } catch (error) {
+      dispatch(addNotification({
+        type: 'error',
+        title: '打开工作区失败',
+        message: error instanceof Error && error.message ? error.message : '无法访问这个工作区目录',
+      }));
+    } finally {
+      workspacePickerPendingRef.current = false;
+    }
+  }, [dispatch, notifyWorkspaceChangeBlocked, tabs]);
+
   // 命令面板预定义命令
   const commands = useDefaultCommands({
     toggleSidebar: () => dispatch(toggleSidebar()),
     toggleTheme: () => dispatch(setThemeMode(themeMode === 'dark' ? 'light' : 'dark')),
     openSettings,
     newFile: () => dispatch(addNotification({ type: 'info', title: '新建文件', message: '功能开发中' })),
-    openWorkspace: () => dispatch(addNotification({ type: 'info', title: '打开工作区', message: '功能开发中' })),
+    openWorkspace: () => {
+      void handleOpenWorkspace();
+    },
   });
 
   // 全局快捷键

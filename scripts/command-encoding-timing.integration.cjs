@@ -65,6 +65,12 @@ async function main() {
   const toolRegistrySource = fs.readFileSync(path.join(__dirname, '..', 'src', 'services', 'toolRegistry.ts'), 'utf8');
   assert.match(terminalSource, /command_terminal_\$\{commandTimestamp\}/, 'Terminal task ids must use the command_ namespace');
   assert.match(terminalSource, /cancelPendingApproval/, 'Terminal Stop must cancel a command that is still awaiting approval');
+  assert.match(terminalSource, /state\.workspace\.currentPath/, 'Terminal must read the active workspace path from Redux');
+  assert.match(terminalSource, /currentWorkspacePath !== '\/workspace'[\s\S]*!currentWorkspacePath\.startsWith\('\/workspace\/'\)/, 'Terminal must not pass demo or in-memory workspace paths as command cwd');
+  assert.match(terminalSource, /cwd: terminalCwd/, 'Terminal command execution must receive the active workspace cwd');
+  assert.doesNotMatch(terminalSource, /autoFocus/, 'Terminal must not steal focus during cold startup');
+  assert.doesNotMatch(terminalSource, /useEffect\(\(\) => \{\s*inputRef\.current\?\.focus\(\);\s*\}, \[activeTab\]\)/, 'Terminal must focus only after explicit user navigation');
+  assert.match(terminalSource, /setActiveTab\(tab\.id\);[\s\S]*window\.setTimeout\(\(\) => inputRef\.current\?\.focus\(\), 0\)/, 'Explicit terminal tab selection should still focus the command input');
   assert.match(commandIpcSource, /approvalId:\s*`tool-task:\$\{taskId\}`/, 'legacy command approval must register a cancellable approval id');
   assert.match(agentLoopSource, /status === 'cancelled' && result\.error\?\.code === 'approval_denied'\) return 0/, 'approval cancellation must not be displayed as command execution time');
   assert.match(toolRegistrySource, /toolFailure\('cancelled', 'approval_denied',[\s\S]*?executionTimeMs: 0/, 'command approval cancellation must be a terminal non-side-effect result');

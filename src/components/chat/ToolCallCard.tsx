@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useId, useRef } from 'react';
 import { ChevronRight, ChevronDown, Wrench, Check, X, Loader2, Copy, Clock, Ban, CircleHelp, CircleStop, AlertTriangle, FileText, RefreshCw } from 'lucide-react';
 import type { ToolCall } from '@/store/slices/conversation';
 import { getPlatform } from '@/platform';
+import { redactSensitiveText, redactSensitiveValue } from '@/services/sensitiveRedaction';
 
 interface ToolCallCardProps {
   toolCall: ToolCall;
@@ -10,6 +11,8 @@ interface ToolCallCardProps {
 }
 
 const MAX_RESULT_PREVIEW = 500;
+const INITIAL_TOOL_ARTIFACT_WINDOW = 12;
+const TOOL_ARTIFACT_WINDOW_INCREMENT = 12;
 
 function artifactDisplayName(path: string): string {
   return path.replace(/\\/g, '/').split('/').filter(Boolean).pop() || 'artifact';
@@ -77,10 +80,56 @@ function searchResponseOf(value: unknown): SearchToolResponse | null {
     : null;
 }
 
+function stringifyToolArgument(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function compactToolArgument(value: unknown, limit = 160): string {
+  const text = stringifyToolArgument(value);
+  if (text.length <= limit) return text;
+  const tailLength = Math.min(40, Math.floor(limit / 3));
+  return `${text.slice(0, limit - tailLength - 1)}…${text.slice(-tailLength)}`;
+}
+
+function orderedToolArgumentEntries(parsedArgs: Record<string, any>, toolName: string): Array<[string, any]> {
+  const entries = Object.entries(parsedArgs);
+  if (toolName !== 'run_command') return entries.slice(0, 2);
+
+  const priorityKeys = ['command', 'cwd'];
+  const prioritizedEntries: Array<[string, any]> = [];
+  for (const priorityKey of priorityKeys) {
+    const entry = entries.find(([key]) => key === priorityKey);
+    if (entry) prioritizedEntries.push(entry);
+  }
+  const priorityKeySet = new Set(priorityKeys);
+  return [
+    ...prioritizedEntries,
+    ...entries.filter(([key]) => !priorityKeySet.has(key)),
+  ];
+}
+
+function formatToolArgumentsPreview(entries: Array<[string, any]>): string {
+  return entries
+    .map(([key, value]) => `${key}=${compactToolArgument(value)}`)
+    .join(', ');
+}
+
+function formatToolArgumentsTitle(entries: Array<[string, any]>): string {
+  return compactToolArgument(entries
+    .map(([key, value]) => `${key}=${compactToolArgument(value, 220)}`)
+    .join(', '), 420);
+}
+
 export function ToolCallCard({ toolCall, onTaskRefresh, onTaskCancel }: ToolCallCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [resultExpanded, setResultExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [artifactLimit, setArtifactLimit] = useState(INITIAL_TOOL_ARTIFACT_WINDOW);
   const bodyId = useId();
   const resultToggleRef = useRef<HTMLButtonElement>(null);
 
@@ -88,10 +137,11 @@ export function ToolCallCard({ toolCall, onTaskRefresh, onTaskCancel }: ToolCall
   try {
     parsedArgs = JSON.parse(toolCall.arguments);
   } catch { /* ignore */ }
+  const displayArgs = redactSensitiveValue(parsedArgs) as Record<string, any>;
 
   const handleCopyResult = useCallback(() => {
     if (toolCall.result) {
-      navigator.clipboard.writeText(toolCall.result);
+      navigator.clipboard.writeText(redactSensitiveText(toolCall.result));
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     }
@@ -139,7 +189,7 @@ export function ToolCallCard({ toolCall, onTaskRefresh, onTaskCancel }: ToolCall
     unknown: '#f59e0b',
   }[effectiveStatus];
 
-  const resultText = toolCall.result || '';
+  const resultText = redactSensitiveText(toolCall.result || '');
   const isLongResult = resultText.length > MAX_RESULT_PREVIEW;
   const displayResult = resultExpanded ? resultText : resultText.slice(0, MAX_RESULT_PREVIEW);
   const searchResponse = toolCall.name === 'search_web' ? searchResponseOf(toolCall.structured) : null;
@@ -150,10 +200,30 @@ export function ToolCallCard({ toolCall, onTaskRefresh, onTaskCancel }: ToolCall
   ).length ?? 0;
   const searchWarnings = [...new Set(searchResponse?.documents?.flatMap(document => document.warnings) ?? [])];
   const promptInjectionDetected = searchWarnings.includes('possible_prompt_injection');
+  const previewArgumentEntries = orderedToolArgumentEntries(displayArgs, toolCall.name);
+  const argumentsPreview = formatToolArgumentsPreview(previewArgumentEntries);
+  const argumentsTitle = formatToolArgumentsTitle(previewArgumentEntries);
+  const visibleArtifacts = (toolCall.artifacts ?? []).slice(0, artifactLimit);
+  const hiddenArtifactCount = Math.max(0, (toolCall.artifacts?.length ?? 0) - visibleArtifacts.length);
+
+  const handleLoadMoreArtifacts = useCallback(() => {
+    setArtifactLimit(limit => limit + TOOL_ARTIFACT_WINDOW_INCREMENT);
+  }, []);
+
+  const handleCollapseArtifacts = useCallback(() => {
+    setArtifactLimit(INITIAL_TOOL_ARTIFACT_WINDOW);
+  }, []);
 
   useEffect(() => {
     if (toolCall.status === 'running' || toolCall.status === 'cancelling') setExpanded(true);
   }, [toolCall.status]);
+
+  useEffect(() => {
+    setArtifactLimit(limit => Math.min(
+      Math.max(INITIAL_TOOL_ARTIFACT_WINDOW, limit),
+      Math.max(INITIAL_TOOL_ARTIFACT_WINDOW, toolCall.artifacts?.length ?? 0),
+    ));
+  }, [toolCall.artifacts?.length]);
 
   return (
     <div className="tool-call-card" style={{ borderLeftColor: statusColor }}>
@@ -168,14 +238,12 @@ export function ToolCallCard({ toolCall, onTaskRefresh, onTaskCancel }: ToolCall
         </span>
         <Wrench size={14} className="tool-call-icon" />
         <span className="tool-call-name">{toolCall.name}</span>
-        <span className={`tool-call-args-preview${searchResponse ? ' search' : ''}`} title={searchResponse ? String(parsedArgs.query || '') : undefined}>
-          {Object.entries(parsedArgs).slice(0, 2).map(([k, v]) => 
-            `${k}=${typeof v === 'string' ? v.slice(0, 20) : v}`
-          ).join(', ')}
+        <span className={`tool-call-args-preview${searchResponse ? ' search' : ''}`} title={searchResponse ? String(displayArgs.query || '') : argumentsTitle}>
+          {argumentsPreview}
         </span>
         {searchResponse && (
           <span className="tool-search-summary">
-            {String(parsedArgs.query || '').slice(0, 26)}{String(parsedArgs.query || '').length > 26 ? '…' : ''} · {searchResponse.hits.length} 条 · {verifiedSearchHits} 正文已读 · {citedSearchHits} 相关引用{promptInjectionDetected ? ' · 疑似提示注入' : searchWarnings.length ? ' · 外部资料' : ''}{problemProviders ? ` · ${problemProviders} 源异常` : ''}
+            {String(displayArgs.query || '').slice(0, 26)}{String(displayArgs.query || '').length > 26 ? '…' : ''} · {searchResponse.hits.length} 条 · {verifiedSearchHits} 正文已读 · {citedSearchHits} 相关引用{promptInjectionDetected ? ' · 疑似提示注入' : searchWarnings.length ? ' · 外部资料' : ''}{problemProviders ? ` · ${problemProviders} 源异常` : ''}
           </span>
         )}
         <span className="tool-call-status-group" role="status" aria-live="polite">
@@ -197,7 +265,7 @@ export function ToolCallCard({ toolCall, onTaskRefresh, onTaskCancel }: ToolCall
           <div className="tool-call-section">
             <div className="tool-call-label">参数</div>
             <pre className="tool-call-code">
-              {JSON.stringify(parsedArgs, null, 2)}
+              {JSON.stringify(displayArgs, null, 2)}
             </pre>
           </div>
           {searchResponse && (
@@ -235,8 +303,8 @@ export function ToolCallCard({ toolCall, onTaskRefresh, onTaskCancel }: ToolCall
               <div className="tool-search-hits">
                 {searchResponse.hits.slice(0, 6).map(hit => (
                   <div key={hit.id} className="tool-search-hit">
-                    <div className="tool-search-hit-title">[{hit.provider}] {hit.title}</div>
-                    <div className="tool-search-hit-url">{hit.canonicalUrl}</div>
+                    <div className="tool-search-hit-title">[{hit.provider}] {redactSensitiveText(hit.title)}</div>
+                    <div className="tool-search-hit-url">{redactSensitiveText(hit.canonicalUrl)}</div>
                     <div className={`tool-search-verification ${hit.contentStatus}`}>
                       {hit.evidenceStatus === 'cited'
                         ? '正文已读取，并产生与查询相关的可重放引用'
@@ -263,11 +331,11 @@ export function ToolCallCard({ toolCall, onTaskRefresh, onTaskCancel }: ToolCall
                         </span>
                       )}
                       <a href={citation.url} onClick={event => handleOpenCitation(event, citation.url)} title="在默认浏览器中打开来源">
-                        {citation.url}
+                        {redactSensitiveText(citation.url)}
                       </a>
                       <span>text-sha256: {citation.contentHash} · {citation.extractorVersion}</span>
                       <span>{citation.retrievedAt}</span>
-                      {citation.quote}
+                      {redactSensitiveText(citation.quote)}
                     </blockquote>
                   ))}
                 </div>
@@ -316,9 +384,9 @@ export function ToolCallCard({ toolCall, onTaskRefresh, onTaskCancel }: ToolCall
           )}
           {toolCall.artifacts && toolCall.artifacts.length > 0 && (
             <div className="tool-call-section">
-              <div className="tool-call-label">完整结果文件</div>
-              <div className="tool-result-artifacts">
-                {toolCall.artifacts.map(artifact => (
+              <div className="tool-call-label">完整结果文件（{visibleArtifacts.length}/{toolCall.artifacts.length}）</div>
+              <div className="tool-result-artifacts" role="group" aria-label={`完整结果文件列表，共 ${toolCall.artifacts.length} 个，当前显示 ${visibleArtifacts.length} 个`}>
+                {visibleArtifacts.map(artifact => (
                   <div className="tool-result-artifact" key={`${artifact.path}:${artifact.sha256 || ''}`}>
                     <FileText size={13} aria-hidden="true" />
                     <div>
@@ -330,6 +398,28 @@ export function ToolCallCard({ toolCall, onTaskRefresh, onTaskCancel }: ToolCall
                     </div>
                   </div>
                 ))}
+                {(hiddenArtifactCount > 0 || artifactLimit > INITIAL_TOOL_ARTIFACT_WINDOW) && (
+                  <div className="tool-result-artifact-controls">
+                    {hiddenArtifactCount > 0 && (
+                      <button
+                        className="tool-result-artifact-btn"
+                        onClick={handleLoadMoreArtifacts}
+                        aria-label={`显示更多完整结果文件，剩余 ${hiddenArtifactCount} 个`}
+                      >
+                        显示更多 {Math.min(TOOL_ARTIFACT_WINDOW_INCREMENT, hiddenArtifactCount)} 个
+                      </button>
+                    )}
+                    {artifactLimit > INITIAL_TOOL_ARTIFACT_WINDOW && (
+                      <button
+                        className="tool-result-artifact-btn"
+                        onClick={handleCollapseArtifacts}
+                        aria-label={`收起完整结果文件到前 ${INITIAL_TOOL_ARTIFACT_WINDOW} 个`}
+                      >
+                        收起到前 {INITIAL_TOOL_ARTIFACT_WINDOW} 个
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           )}

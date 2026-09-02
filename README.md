@@ -74,6 +74,17 @@ npm run submission:audit -- C:\path\to\separate-anonymous-repository
 
 The audit target is mandatory. It checks the current file manifest, private-path and secret markers, media metadata, Git remotes, refs, commit identities, messages, historical paths, and historical text blobs. Build the installer from the audited anonymous repository rather than copying an existing `release/` directory.
 
+## Final ZIP delivery
+
+Create the final delivery ZIP from the audited anonymous repository, not from a runtime worktree. The final package includes anonymous source files, `README.txt`, the demonstration video, `THIRD_PARTY_NOTICES.md`, `LICENSE`, and `FINAL_DELIVERY_MANIFEST.json`; it must not include installers, credentials, profiles, `node_modules`, build output, release output, or private absolute paths.
+
+```powershell
+npm run submission:final-export -- C:\path\to\final-delivery --from C:\path\to\separate-anonymous-repository --readme C:\path\to\README.txt --video C:\path\to\demo.mp4 --replace
+npm run submission:final-audit -- C:\path\to\final-delivery.zip
+```
+
+`submission:final-export` writes `FINAL_DELIVERY_MANIFEST.json`, audits every normalized relative path, byte size, SHA256, README supplement, and video supplement, then writes a deterministic ZIP beside the directory as `<final-delivery>.zip` unless `--zip <file.zip>` is supplied. The command prints the final ZIP SHA256 and verifies the ZIP again after extracting it to a temporary directory.
+
 ## Security and privacy
 
 - API keys and OAuth credentials are stored by the Electron main process through the operating system's secure storage.

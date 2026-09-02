@@ -1,4 +1,5 @@
 import { Component, type ReactNode } from 'react';
+import { requestWindowReload } from '../platform';
 
 interface Props { children: ReactNode; }
 interface State { hasError: boolean; error: Error | null; }
@@ -29,7 +30,7 @@ export class ErrorBoundary extends Component<Props, State> {
             {this.state.error?.message || '未知错误'}
           </p>
           <button
-            onClick={() => window.location.reload()}
+            onClick={() => requestWindowReload()}
             style={{
               padding: '8px 24px', borderRadius: 8, border: 'none',
               background: 'var(--syn-primary)', color: 'white', cursor: 'pointer',

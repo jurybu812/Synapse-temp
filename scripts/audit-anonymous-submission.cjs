@@ -12,18 +12,21 @@ const rootRealPrefix = `${rootRealPath}${path.sep}`;
 const failures = [];
 const allowedTopLevel = new Set([
   '.git', '.gitignore', 'SUBMISSION_MANIFEST.json', 'electron', 'eslint.config.js', 'index.html', 'LICENSE',
-  'package-lock.json', 'package.json', 'public', 'README.md', 'scripts', 'skills', 'src',
+  'package-lock.json', 'package.json', 'public', 'README.md', 'scripts', 'shared', 'skills', 'src',
   'THIRD_PARTY_NOTICES.md', 'tsconfig.app.json', 'tsconfig.electron.json', 'tsconfig.json',
   'tsconfig.node.json', 'vite.config.ts', 'workflows',
 ]);
 const forbiddenNames = new Set([
-  '.agents', '.codex', '.env', 'coverage', 'dist', 'dist-electron', 'logs', 'node_modules', 'plans', 'release',
+  '.agents', '.codex', '.env', 'coverage', 'credentials', 'dist', 'dist-electron', 'logs',
+  'node_modules', 'plans', 'profile', 'release',
 ]);
 const forbiddenFileNames = new Set(['.npmrc', '.netrc', '.pypirc', '.yarnrc', '.yarnrc.yml']);
 const forbiddenExtensions = new Set(['.db', '.dpapi', '.key', '.log', '.p12', '.pem', '.pfx', '.sqlite', '.sqlite3']);
 const textExtensions = new Set([
   '.cjs', '.css', '.gitignore', '.html', '.js', '.json', '.md', '.mjs', '.svg', '.ts', '.tsx', '.txt', '.yml', '.yaml',
 ]);
+const moduleSourceExtensions = new Set(['.cjs', '.js', '.mjs', '.ts', '.tsx']);
+const moduleResolutionExtensions = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.css', '.svg'];
 const home = os.homedir();
 const username = os.userInfo().username;
 const privateWorkspaceMarker = '\u0056\u0043\u5de5\u5177\u5305';
@@ -127,6 +130,52 @@ function inspectText(label, buffer) {
   }
 }
 
+function collectRelativeModuleSpecifiers(text) {
+  const specifiers = [];
+  const pattern = /\b(?:import|export)\s+(?:type\s+)?(?:[^'";]*?\s+from\s*)?['"]([^'"]+)['"]|\b(?:import|require)\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    const specifier = match[1] || match[2];
+    if (specifier?.startsWith('./') || specifier?.startsWith('../')) specifiers.push(specifier);
+  }
+  return specifiers;
+}
+
+function modulePathCandidates(originRelativePath, specifier) {
+  const originDirectory = path.posix.dirname(originRelativePath);
+  const normalized = path.posix.normalize(path.posix.join(originDirectory, specifier));
+  if (path.posix.isAbsolute(normalized) || normalized === '..' || normalized.startsWith('../')) return [];
+  const candidates = [normalized];
+  if (!path.posix.extname(normalized)) {
+    for (const extension of moduleResolutionExtensions) candidates.push(`${normalized}${extension}`);
+    for (const extension of moduleResolutionExtensions) candidates.push(path.posix.join(normalized, `index${extension}`));
+  }
+  return candidates;
+}
+
+function hasResolvedModuleReference(exportedPaths, originRelativePath, specifier) {
+  return modulePathCandidates(originRelativePath, specifier).some(candidate => exportedPaths.has(candidate));
+}
+
+function isSharedModuleReference(originRelativePath, specifier) {
+  return modulePathCandidates(originRelativePath, specifier).some(candidate => candidate === 'shared' || candidate.startsWith('shared/'));
+}
+
+function inspectSourceReferenceClosure(filePaths, exportedPaths) {
+  for (const filePath of filePaths) {
+    const originRelativePath = relative(filePath);
+    const topLevel = originRelativePath.split('/')[0];
+    if (!['electron', 'shared', 'src'].includes(topLevel) || !moduleSourceExtensions.has(path.posix.extname(originRelativePath))) continue;
+    const text = fs.readFileSync(filePath, 'utf8');
+    for (const specifier of collectRelativeModuleSpecifiers(text)) {
+      if (!isSharedModuleReference(originRelativePath, specifier)) continue;
+      if (!hasResolvedModuleReference(exportedPaths, originRelativePath, specifier)) {
+        failures.push(`Unresolved exported module reference: ${originRelativePath} -> ${specifier}`);
+      }
+    }
+  }
+}
+
 function walk(directory, files) {
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
     if (entry.name === '.git') continue;
@@ -210,6 +259,7 @@ if (fs.statSync(manifestPath, { throwIfNoEntry: false })?.isFile()) {
     const fileName = relative(filePath);
     if (fileName !== 'SUBMISSION_MANIFEST.json' && !manifestPaths.has(fileName)) failures.push(`File missing from manifest: ${fileName}`);
   }
+  inspectSourceReferenceClosure(files, manifestPaths);
 }
 
 const gitDirectory = path.join(root, '.git');

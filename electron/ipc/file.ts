@@ -3,8 +3,8 @@
  * 文件系统操作：read/write/list/search/rename/delete
  */
 
-import { app, BrowserWindow, ipcMain, shell, type WebContents } from 'electron';
-import { randomUUID } from 'crypto';
+import { app, ipcMain, shell, type WebContents } from 'electron';
+import { createHash, randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
@@ -34,14 +34,72 @@ const fileApprovalPolicies = new Map<number, { autoApproveWrite: boolean }>();
 
 interface ActiveSensitiveApproval {
     senderId: number;
-    window: BrowserWindow;
+    requestId: string;
+    finish: (approved: boolean) => void;
     cancel: () => void;
 }
 
 const activeSensitiveApprovals = new Map<string, ActiveSensitiveApproval>();
+const activeSensitiveApprovalRequestKeys = new Map<string, string>();
+let sensitiveApprovalResponseHandlerRegistered = false;
+
+type ExpectedContentOptions = { expectedContent?: string };
+
+function readExpectedContentOption(options?: ExpectedContentOptions): string | undefined {
+    if (!options || !Object.prototype.hasOwnProperty.call(options, 'expectedContent')) return undefined;
+    if (typeof options.expectedContent !== 'string') throw new Error('删除内容校验参数无效');
+    return options.expectedContent;
+}
+
+function contentDeleteConflict(currentContent: string | null) {
+    return {
+        conflict: true,
+        message: '文件已在删除前被其它操作修改',
+        currentContent,
+    };
+}
+
+function deleteFileIfContentMatches(targetPath: string, expectedContent: string) {
+    if (!fs.existsSync(targetPath)) return contentDeleteConflict(null);
+    const stat = fs.statSync(targetPath);
+    if (!stat.isFile()) return contentDeleteConflict(null);
+    const currentContent = fs.readFileSync(targetPath, 'utf-8');
+    if (currentContent !== expectedContent) return contentDeleteConflict(currentContent);
+    fs.rmSync(targetPath, { force: true });
+    return { success: true };
+}
 
 function sensitiveApprovalKey(senderId: number, approvalId: string): string {
     return `${senderId}:${approvalId}`;
+}
+
+type SensitiveApprovalLevel = 'auto' | 'read' | 'write' | 'command' | 'dangerous';
+
+interface SensitiveApprovalRendererRequest {
+    requestId: string;
+    title: string;
+    message: string;
+    details: string[];
+    confirmLabel: string;
+    toolName: string;
+    level: SensitiveApprovalLevel;
+    conversationId?: string;
+    ownerId?: string;
+    runId?: string;
+    callId?: string;
+}
+
+function registerSensitiveApprovalResponseHandler(): void {
+    if (sensitiveApprovalResponseHandlerRegistered) return;
+    sensitiveApprovalResponseHandlerRegistered = true;
+    ipcMain.on('sensitive-approval:response', (event, payload: { requestId?: unknown; approved?: unknown }) => {
+        const requestId = typeof payload?.requestId === 'string' ? payload.requestId : '';
+        const registryKey = activeSensitiveApprovalRequestKeys.get(requestId);
+        if (!registryKey) return;
+        const active = activeSensitiveApprovals.get(registryKey);
+        if (!active || active.senderId !== event.sender.id) return;
+        active.finish(payload.approved === true);
+    });
 }
 
 export function cancelSensitiveOperationApproval(senderId: number, approvalId: string): boolean {
@@ -65,6 +123,13 @@ export function shutdownSensitiveOperationApprovals(): void {
 }
 
 function ensureSenderCleanup(sender: WebContents): void {
+    if (sender.isDestroyed()) {
+        cleanupRegisteredSenders.delete(sender.id);
+        fileApprovalPolicies.delete(sender.id);
+        cancelSensitiveOperationApprovalsForSender(sender.id);
+        revokeFileAccessGrantsForSender(sender.id);
+        return;
+    }
     if (cleanupRegisteredSenders.has(sender.id)) return;
     cleanupRegisteredSenders.add(sender.id);
     sender.once('destroyed', () => {
@@ -75,16 +140,6 @@ function ensureSenderCleanup(sender: WebContents): void {
     });
 }
 
-function escapeHtml(value: string): string {
-    return value.replace(/[&<>"']/g, character => ({
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        '"': '&quot;',
-        "'": '&#39;',
-    })[character]!);
-}
-
 export function confirmSensitiveOperationInMainWindow(
     sender: WebContents,
     options: {
@@ -92,41 +147,24 @@ export function confirmSensitiveOperationInMainWindow(
         message: string;
         details: string[];
         confirmLabel: string;
+        toolName?: string;
+        level?: SensitiveApprovalLevel;
         approvalId?: string;
         timeoutMs?: number;
+        conversationId?: string;
+        ownerId?: string;
+        runId?: string;
+        callId?: string;
     },
 ): Promise<boolean> {
     if (sender.isDestroyed()) return Promise.resolve(false);
     ensureSenderCleanup(sender);
-    const parent = BrowserWindow.fromWebContents(sender) ?? undefined;
-    const nonce = randomUUID();
-    const approvalUrl = `synapse-file-approval://approve/${nonce}`;
-    const cancelUrl = `synapse-file-approval://cancel/${nonce}`;
+    registerSensitiveApprovalResponseHandler();
+    const requestId = `sensitive_${randomUUID()}`;
     const registryKey = options.approvalId
         ? sensitiveApprovalKey(sender.id, options.approvalId)
-        : `anonymous:${sender.id}:${nonce}`;
+        : `anonymous:${sender.id}:${requestId}`;
     if (options.approvalId) activeSensitiveApprovals.get(registryKey)?.cancel();
-    const modal = new BrowserWindow({
-        parent,
-        modal: Boolean(parent),
-        show: false,
-        width: 520,
-        height: 360,
-        minWidth: 440,
-        minHeight: 320,
-        resizable: false,
-        frame: false,
-        title: options.title,
-        backgroundColor: '#12131a',
-        autoHideMenuBar: true,
-        webPreferences: {
-            contextIsolation: true,
-            nodeIntegration: false,
-            sandbox: true,
-        },
-    });
-    modal.setMenuBarVisibility(false);
-    modal.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
     return new Promise<boolean>(resolve => {
         let settled = false;
@@ -139,14 +177,21 @@ export function confirmSensitiveOperationInMainWindow(
                 clearTimeout(timeoutHandle);
                 timeoutHandle = null;
             }
-            modal.removeListener('closed', onClosed);
-            modal.removeListener('ready-to-show', onReadyToShow);
-            if (!modal.webContents.isDestroyed()) {
-                modal.webContents.removeListener('will-navigate', onWillNavigate);
-                modal.webContents.removeListener('before-input-event', onBeforeInputEvent);
-            }
+            sender.removeListener('destroyed', onSenderGone);
+            sender.removeListener('render-process-gone', onSenderGone);
+            sender.removeListener('did-start-navigation', onDidStartNavigation);
             if (activeSensitiveApprovals.get(registryKey) === activeRecord) {
                 activeSensitiveApprovals.delete(registryKey);
+                activeSensitiveApprovalRequestKeys.delete(requestId);
+            }
+        };
+
+        const notifyRendererCancel = () => {
+            if (sender.isDestroyed()) return;
+            try {
+                sender.send('sensitive-approval:cancel', { requestId });
+            } catch {
+                return;
             }
         };
 
@@ -154,50 +199,48 @@ export function confirmSensitiveOperationInMainWindow(
             if (settled) return;
             settled = true;
             cleanup();
-            if (!modal.isDestroyed()) modal.destroy();
+            if (!approved) notifyRendererCancel();
             resolve(approved);
         };
         const cancel = () => finish(false);
 
-        const onClosed = () => finish(false);
-        const onWillNavigate = (event: { preventDefault(): void }, url: string) => {
-            if (url !== approvalUrl && url !== cancelUrl) return;
-            event.preventDefault();
-            finish(url === approvalUrl);
-        };
-        const onBeforeInputEvent = (
-            event: { preventDefault(): void },
-            input: { type: string; key: string; control?: boolean; meta?: boolean },
+        const onSenderGone = () => finish(false);
+        const onDidStartNavigation = (
+            _event: Electron.Event,
+            _url: string,
+            isInPlace: boolean,
+            isMainFrame: boolean,
         ) => {
-            if (input.type !== 'keyDown') return;
-            if (input.key === 'Escape') {
-                event.preventDefault();
-                finish(false);
-                return;
-            }
-            if (input.key !== 'Enter') return;
-            event.preventDefault();
-            if (input.control || input.meta) finish(true);
-        };
-        const onReadyToShow = () => {
-            if (!settled && !modal.isDestroyed()) modal.show();
+            if (!isMainFrame || isInPlace) return;
+            finish(false);
         };
 
-        activeRecord = { senderId: sender.id, window: modal, cancel };
+        activeRecord = { senderId: sender.id, requestId, finish, cancel };
         activeSensitiveApprovals.set(registryKey, activeRecord);
+        activeSensitiveApprovalRequestKeys.set(requestId, registryKey);
         timeoutHandle = setTimeout(cancel, timeoutMs);
-        modal.once('closed', onClosed);
-        modal.webContents.on('will-navigate', onWillNavigate);
-        modal.webContents.on('before-input-event', onBeforeInputEvent);
-        modal.once('ready-to-show', onReadyToShow);
+        sender.once('destroyed', onSenderGone);
+        sender.once('render-process-gone', onSenderGone);
+        sender.on('did-start-navigation', onDidStartNavigation);
 
-        const detailRows = options.details.map(detail => `<li>${escapeHtml(detail)}</li>`).join('');
-        const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"><title>${escapeHtml(options.title)}</title><style>
-          :root{color-scheme:dark;font-family:"Segoe UI","Microsoft YaHei",sans-serif;background:#11131b;color:#eef0ff}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 86% -4%,rgba(124,92,255,.35),transparent 38%),linear-gradient(145deg,#181a27,#101119 62%,#15111d)}.chrome{height:38px;display:flex;align-items:center;justify-content:space-between;padding:0 10px 0 16px;color:#bfc3da;font-size:12px;letter-spacing:.08em;text-transform:uppercase;-webkit-app-region:drag}.close{min-width:30px;min-height:28px;border:0;background:transparent;color:#bfc3da;border-radius:8px;-webkit-app-region:no-drag}main{margin:0 18px 18px;border:1px solid rgba(151,129,255,.34);border-radius:16px;background:rgba(23,24,35,.96);box-shadow:0 22px 70px rgba(0,0,0,.45);padding:20px}h1{font-size:18px;margin:0 0 10px}p{margin:0 0 14px;color:#c7cadb;line-height:1.6}ul{max-height:132px;overflow:auto;margin:0;padding:10px 10px 10px 28px;border-radius:12px;background:#0d0f17;border:1px solid #2d3041;color:#e7e8f3;line-height:1.55;overflow-wrap:anywhere}footer{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:18px}.hint{color:#9197b6;font-size:12px}button{min-width:104px;min-height:36px;border-radius:10px;border:1px solid #3b3e50;background:#232635;color:#e8e9f4;font-weight:600;cursor:pointer}button:focus-visible{outline:3px solid #8b7cff;outline-offset:2px}.confirm{border-color:#806dff;background:linear-gradient(135deg,#725dff,#9a5cff);color:white}.actions{display:flex;gap:10px}
-        </style></head><body><div class="chrome"><span>Synapse 安全确认</span><button id="close" class="close" type="button" aria-label="关闭">×</button></div><main><h1>${escapeHtml(options.title)}</h1><p>${escapeHtml(options.message)}</p><ul>${detailRows}</ul><footer><span class="hint">Esc 取消，Ctrl/Cmd+Enter 批准</span><span class="actions"><button id="cancel" type="button" autofocus>取消</button><button id="approve" type="button" class="confirm">${escapeHtml(options.confirmLabel)}</button></span></footer></main><script>
-          const cancel=()=>{location.href=${JSON.stringify(cancelUrl)}};const approve=()=>{location.href=${JSON.stringify(approvalUrl)}};document.getElementById('cancel').addEventListener('click',event=>{if(event.isTrusted)cancel()});document.getElementById('close').addEventListener('click',event=>{if(event.isTrusted)cancel()});document.getElementById('approve').addEventListener('click',event=>{if(event.isTrusted)approve()});document.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();cancel();return}if(event.key!=='Enter')return;event.preventDefault();if((event.ctrlKey||event.metaKey)&&event.isTrusted)approve()});
-        </script></body></html>`;
-        void modal.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`).catch(() => finish(false));
+        const rendererRequest: SensitiveApprovalRendererRequest = {
+            requestId,
+            title: options.title,
+            message: options.message,
+            details: options.details,
+            confirmLabel: options.confirmLabel,
+            toolName: options.toolName ?? options.title,
+            level: options.level ?? 'dangerous',
+            conversationId: options.conversationId,
+            ownerId: options.ownerId,
+            runId: options.runId,
+            callId: options.callId,
+        };
+        try {
+            sender.send('sensitive-approval:request', rendererRequest);
+        } catch {
+            finish(false);
+        }
     });
 }
 
@@ -267,8 +310,86 @@ function findLibreOffice(): string | null {
 }
 
 type OfficeConvertResult =
-    | { success: true; outputPath: string; format: 'pdf'; tempDir: string }
+    | { success: true; outputPath: string; format: 'pdf'; tempDir?: string; cacheHit?: boolean }
     | { error: true; message: string };
+
+type OfficeSourceIdentity = {
+    canonicalPath: string;
+    comparablePath: string;
+    size: number;
+    mtimeMs: number;
+};
+
+const OFFICE_PREVIEW_CACHE_VERSION = 'v1';
+const officeConversionFlights = new Map<string, Promise<OfficeConvertResult>>();
+
+function isReadablePdf(filePath: string): boolean {
+    try {
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile() || stat.size < 5) return false;
+        const fd = fs.openSync(filePath, 'r');
+        try {
+            const header = Buffer.alloc(5);
+            fs.readSync(fd, header, 0, header.length, 0);
+            if (header.toString('ascii') !== '%PDF-') return false;
+            const tailLength = Math.min(stat.size, 2048);
+            const tail = Buffer.alloc(tailLength);
+            fs.readSync(fd, tail, 0, tail.length, stat.size - tailLength);
+            return tail.toString('latin1').includes('%%EOF');
+        } finally {
+            fs.closeSync(fd);
+        }
+    } catch {
+        return false;
+    }
+}
+
+function getOfficeConverterIdentity(): string {
+    const soffice = findLibreOffice();
+    if (!soffice) return 'missing';
+    if (!soffice.includes(path.sep) && !soffice.includes('/')) return `command:${soffice}`;
+    try {
+        const canonicalPath = fs.realpathSync.native(soffice);
+        const stat = fs.statSync(canonicalPath);
+        const comparablePath = process.platform === 'win32' ? canonicalPath.toLowerCase() : canonicalPath;
+        return `${comparablePath}:${stat.size}:${stat.mtimeMs}`;
+    } catch {
+        return `path:${soffice}`;
+    }
+}
+
+function readOfficeSourceIdentity(sourcePath: string): OfficeSourceIdentity {
+    const canonicalPath = fs.realpathSync.native(sourcePath);
+    const comparablePath = process.platform === 'win32' ? canonicalPath.toLowerCase() : canonicalPath;
+    const stat = fs.statSync(canonicalPath);
+    return { canonicalPath, comparablePath, size: stat.size, mtimeMs: stat.mtimeMs };
+}
+
+function sameOfficeSourceIdentity(left: OfficeSourceIdentity, right: OfficeSourceIdentity): boolean {
+    return left.comparablePath === right.comparablePath
+        && left.size === right.size
+        && left.mtimeMs === right.mtimeMs;
+}
+
+function removeOfficePathBestEffort(targetPath: string, recursive = false): void {
+    try {
+        fs.rmSync(targetPath, { recursive, force: true });
+    } catch {}
+}
+
+function getOfficeCacheEntry(identity: OfficeSourceIdentity): { cacheDir: string; outputPath: string; key: string } {
+    const key = createHash('sha256')
+        .update(JSON.stringify({
+            version: OFFICE_PREVIEW_CACHE_VERSION,
+            path: identity.comparablePath,
+            size: identity.size,
+            mtimeMs: identity.mtimeMs,
+            converter: getOfficeConverterIdentity(),
+        }))
+        .digest('hex');
+    const cacheDir = path.join(app.getPath('userData'), 'cache', 'office-previews', key);
+    return { cacheDir, outputPath: path.join(cacheDir, 'preview.pdf'), key };
+}
 
 /**
  * ★ FIX-1：把一个本地文件系统目录转成 LibreOffice 能吃的 file URL。
@@ -401,6 +522,78 @@ async function convertOfficeToPdf(sourcePath: string): Promise<OfficeConvertResu
             ? `Office 转换失败，LibreOffice 配置可能正被其它实例占用（尝试 ${attempts} 次，用时 ${elapsedSeconds} 秒）。\n${lastMessage}`
             : `Office 转换失败（尝试 ${attempts} 次，用时 ${elapsedSeconds} 秒）。\n${lastMessage}`,
     };
+}
+
+async function convertOfficeToPdfCached(
+    sourcePath: string,
+    sourceIdentity: OfficeSourceIdentity,
+    remainingSourceChangeRetries = 1,
+): Promise<OfficeConvertResult> {
+    const cache = getOfficeCacheEntry(sourceIdentity);
+    const inFlight = officeConversionFlights.get(cache.key);
+    if (inFlight) return inFlight;
+
+    if (isReadablePdf(cache.outputPath)) {
+        const currentIdentity = readOfficeSourceIdentity(sourcePath);
+        if (!sameOfficeSourceIdentity(sourceIdentity, currentIdentity)) {
+            if (remainingSourceChangeRetries > 0) {
+                return convertOfficeToPdfCached(sourcePath, currentIdentity, remainingSourceChangeRetries - 1);
+            }
+            return { error: true, message: 'Office 文件在预览期间持续变化，请保存完成后重试' };
+        }
+        return { success: true, outputPath: cache.outputPath, format: 'pdf', cacheHit: true };
+    }
+    if (fs.existsSync(cache.cacheDir)) {
+        removeOfficePathBestEffort(cache.cacheDir, true);
+    }
+
+    const flight = (async (): Promise<OfficeConvertResult> => {
+        const converted = await convertOfficeToPdf(sourcePath);
+        if (!('success' in converted)) return converted;
+
+        const temporaryOutput = `${cache.outputPath}.${randomUUID()}.tmp`;
+        let retainConvertedTemp = false;
+        try {
+            if (!isReadablePdf(converted.outputPath)) {
+                return { error: true, message: '转换结果不是有效 PDF' };
+            }
+            let currentIdentity: OfficeSourceIdentity;
+            try {
+                currentIdentity = readOfficeSourceIdentity(sourcePath);
+            } catch {
+                return { error: true, message: 'Office 文件在预览期间已移动或删除，请重新打开' };
+            }
+            if (!sameOfficeSourceIdentity(sourceIdentity, currentIdentity)) {
+                if (remainingSourceChangeRetries > 0) {
+                    return await convertOfficeToPdfCached(sourcePath, currentIdentity, remainingSourceChangeRetries - 1);
+                }
+                return { error: true, message: 'Office 文件在预览期间持续变化，请保存完成后重试' };
+            }
+            try {
+                fs.mkdirSync(cache.cacheDir, { recursive: true });
+                fs.copyFileSync(converted.outputPath, temporaryOutput);
+                if (!isReadablePdf(temporaryOutput)) {
+                    throw new Error('缓存副本不是有效 PDF');
+                }
+                fs.renameSync(temporaryOutput, cache.outputPath);
+                return { success: true, outputPath: cache.outputPath, format: 'pdf', cacheHit: false };
+            } catch {
+                removeOfficePathBestEffort(cache.cacheDir, true);
+                retainConvertedTemp = true;
+                return { ...converted, cacheHit: false };
+            }
+        } finally {
+            removeOfficePathBestEffort(temporaryOutput);
+            if (!retainConvertedTemp && converted.tempDir) removeOfficePathBestEffort(converted.tempDir, true);
+        }
+    })();
+
+    officeConversionFlights.set(cache.key, flight);
+    try {
+        return await flight;
+    } finally {
+        officeConversionFlights.delete(cache.key);
+    }
 }
 
 export function registerFileHandlers(): void {
@@ -555,14 +748,16 @@ export function registerFileHandlers(): void {
         try {
             const resolved = enforceAgentFileAccess(filePath, access, e.sender.id, 'read');
             if (!fs.existsSync(resolved)) throw new Error(`文件不存在: ${resolved}`);
-            const stat = fs.statSync(resolved);
-            if (stat.size > 50 * 1024 * 1024) throw new Error('文件超过 50MB 限制');
+            const sourceIdentity = readOfficeSourceIdentity(resolved);
+            if (sourceIdentity.size > 50 * 1024 * 1024) throw new Error('文件超过 50MB 限制');
             const ext = path.extname(resolved).toLowerCase();
             if (!OFFICE_EXTENSIONS.has(ext)) throw new Error(`不支持的 Office 类型: ${ext}`);
-            const result = await convertOfficeToPdf(resolved);
+            const result = await convertOfficeToPdfCached(resolved, sourceIdentity);
             if ('success' in result) {
                 ensureSenderCleanup(e.sender);
-                registerTemporaryFileRoot(result.tempDir, e.sender.id);
+                if (!e.sender.isDestroyed()) {
+                    registerTemporaryFileRoot(path.dirname(result.outputPath), e.sender.id);
+                }
             }
             return result;
         } catch (err: any) {
@@ -609,9 +804,18 @@ export function registerFileHandlers(): void {
         }
     });
 
-    ipcMain.handle('file:delete', async (e, targetPath: string, access?: AgentFileAccessContext) => {
+    ipcMain.handle('file:delete', async (
+        e,
+        targetPath: string,
+        access?: AgentFileAccessContext,
+        options?: ExpectedContentOptions,
+    ) => {
         try {
             targetPath = await authorizeFileMutation(e.sender, targetPath, access, 'delete');
+            const expectedContent = readExpectedContentOption(options);
+            if (expectedContent !== undefined) {
+                return deleteFileIfContentMatches(targetPath, expectedContent);
+            }
             fs.rmSync(targetPath, { recursive: true, force: true });
             return { success: true };
         } catch (err: any) {

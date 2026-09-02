@@ -61,8 +61,9 @@ import { describeCapabilities, providerIdForModel } from '@/services/modelCapabi
 import type { AIModelOption } from '@/types/aiModel';
 import { addNotification } from '@/store/slices/notifications';
 import { exitWorktreeByPath } from '@/store/slices/worktreeSession';
-import { isElectron, platform } from '@/platform';
+import { isElectron, platform, requestWindowReload } from '@/platform';
 import type { OpenAICodexStatus, PlatformInfo, WindsurfLocalImportCandidate, WindsurfStatus, WorktreeEntry } from '@/platform';
+import { tryBeginWorkspacePickerPending } from '@/services/workspacePickerCoordinator';
 import {
   beginProviderCatalogRefresh,
   invalidateProviderCatalogRefresh,
@@ -210,6 +211,8 @@ export function SettingsPanel() {
   const [windsurfBusy, setWindsurfBusy] = useState(false);
   const [windsurfTokenDraft, setWindsurfTokenDraft] = useState('');
   const [windsurfLocalImportMessage, setWindsurfLocalImportMessage] = useState<string | null>(null);
+  const [windsurfLocalImportCandidates, setWindsurfLocalImportCandidates] = useState<WindsurfLocalImportCandidate[]>([]);
+  const [selectedWindsurfCandidate, setSelectedWindsurfCandidate] = useState('');
   const [mcpServers, setMcpServers] = useState<Record<string, McpServerInfo>>({});
   const [loadingMcpStatus, setLoadingMcpStatus] = useState(false);
   const [platformInfo, setPlatformInfo] = useState<PlatformInfo | null>(null);
@@ -509,14 +512,38 @@ export function SettingsPanel() {
     }
   }, [agentSettings.currentModel, agentSettings.systemModel, availableModels, dispatch, settings.providerCredentials]);
 
-  const handleWindsurfLocalImport = useCallback(async () => {
+  const handleWindsurfLocalImport = useCallback(async (candidateFingerprint?: string) => {
     if (!platform.provider) return;
     setWindsurfBusy(true);
+    if (!candidateFingerprint) {
+      setWindsurfLocalImportCandidates([]);
+      setSelectedWindsurfCandidate('');
+    }
     setWindsurfLocalImportMessage('正在只读检查本机 Devin/Windsurf 登录状态，成功后只会写入 Synapse 的安全存储副本。');
     try {
-      let outcome = await importLocalWindsurfCredential(dispatch);
+      let outcome = await importLocalWindsurfCredential(dispatch, candidateFingerprint ? { candidateFingerprint } : undefined);
+      const firstError = outcome.result.error;
+      if (!outcome.result.ok && firstError?.code === 'multiple_accounts') {
+        const candidates = firstError.candidates ?? outcome.result.candidates ?? [];
+        setWindsurfStatus(outcome.result.status);
+        setWindsurfLocalImportCandidates(candidates);
+        setSelectedWindsurfCandidate('');
+        setWindsurfLocalImportMessage('检测到多个本机账号，请先选择账号，再执行导入。');
+        dispatch(addNotification({ type: 'info', title: '请选择 Windsurf 账号', message: 'Synapse 不会自动选择本机账号' }));
+        return;
+      }
       if (!outcome.result.ok && outcome.result.error?.code === 'replace_required') {
         const error = outcome.result.error;
+        const selectedCandidateFingerprint = error.candidates?.find(candidate => candidate.candidateFingerprint === candidateFingerprint)?.candidateFingerprint
+          ?? error.candidates?.[0]?.candidateFingerprint
+          ?? candidateFingerprint;
+        if (!selectedCandidateFingerprint || !error.confirmationToken) {
+          setWindsurfStatus(outcome.result.status);
+          setWindsurfLocalImportMessage('本机账号选择已失效，请重新扫描并选择。');
+          setWindsurfLocalImportCandidates(error.candidates ?? []);
+          setSelectedWindsurfCandidate('');
+          return;
+        }
         const confirmed = await confirmAction({
           title: '替换 Windsurf 账号？',
           message: `当前 Synapse 账号：${error.existingAccountLabel || '未命名账号'}；本机候选账号：${error.candidateAccountLabel || describeWindsurfCandidates(error.candidates) || '未命名账号'}。确认后只替换 Synapse 的加密副本，不修改 Devin/Windsurf 原始登录状态。`,
@@ -530,17 +557,26 @@ export function SettingsPanel() {
           return;
         }
         setWindsurfLocalImportMessage('正在替换 Synapse 中的 Windsurf 凭据副本，不会修改源客户端。');
-        outcome = await importLocalWindsurfCredential(dispatch, error.confirmationToken);
+        outcome = await importLocalWindsurfCredential(dispatch, {
+          confirmationToken: error.confirmationToken,
+          candidateFingerprint: selectedCandidateFingerprint,
+        });
       }
       setWindsurfStatus(outcome.result.status);
       setLocalAvailableModels(store.getState().agentSettings.availableModels ?? []);
       if (!outcome.result.ok) {
-        const candidates = describeWindsurfCandidates(outcome.result.error?.candidates ?? outcome.result.candidates);
+        const candidateOptions = outcome.result.error?.candidates ?? outcome.result.candidates ?? [];
+        const selectableError = ['multiple_accounts', 'candidate_selection_invalid'].includes(outcome.result.error?.code ?? '');
+        setWindsurfLocalImportCandidates(selectableError ? candidateOptions : []);
+        setSelectedWindsurfCandidate(current => candidateOptions.some(candidate => candidate.candidateFingerprint === current) ? current : '');
+        const candidates = describeWindsurfCandidates(candidateOptions);
         const message = `${outcome.result.error?.message ?? '本机导入失败'}${candidates ? ` 候选：${candidates}` : ''}`;
         setWindsurfLocalImportMessage(message);
         dispatch(addNotification({ type: 'error', title: '本机导入失败', message }));
         return;
       }
+      setWindsurfLocalImportCandidates([]);
+      setSelectedWindsurfCandidate('');
       const accountLabel = outcome.result.accountLabel ? `「${outcome.result.accountLabel}」` : '本机账号';
       const action = outcome.result.unchanged
         ? '已连接同一个本机账号，无需重复导入'
@@ -808,15 +844,19 @@ export function SettingsPanel() {
   // ── git worktree (M2-4) 操作 ──
   const pickWorktreeRepo = useCallback(async () => {
     if (!isElectron) return;
+    const finishWorkspacePickerPending = tryBeginWorkspacePickerPending();
+    if (!finishWorkspacePickerPending) return;
     try {
-      const ws = await platform.workspace.open();
-      if (ws?.path) {
-        setWorktreeRepoRoot(ws.path);
+      const dirPath = await platform.workspace.selectDirectory();
+      if (dirPath) {
+        setWorktreeRepoRoot(dirPath);
         setWorktrees([]);
         setWorktreeLoaded(false);
       }
     } catch (error: any) {
       dispatch(addNotification({ type: 'error', title: '选择仓库失败', message: error?.message ?? '无法打开文件夹选择器' }));
+    } finally {
+      finishWorkspacePickerPending();
     }
   }, [dispatch]);
 
@@ -941,7 +981,7 @@ export function SettingsPanel() {
         throw new Error('导入文件没有可识别的 Synapse 设置键');
       }
       dispatch(addNotification({ type: 'success', title: '设置已导入', message: `已导入 ${imported} 个设置条目，页面将刷新` }));
-      window.setTimeout(() => window.location.reload(), 300);
+      window.setTimeout(() => requestWindowReload(), 300);
     } catch (error: any) {
       dispatch(addNotification({ type: 'error', title: '导入失败', message: error?.message ?? 'JSON 解析失败' }));
     }
@@ -1406,6 +1446,8 @@ export function SettingsPanel() {
                     onClick={async () => {
                       if (!platform.provider) return;
                       setWindsurfLocalImportMessage(null);
+                      setWindsurfLocalImportCandidates([]);
+                      setSelectedWindsurfCandidate('');
                       setWindsurfBusy(true);
                       try {
                         setWindsurfStatus(await platform.provider.windsurfLogin());
@@ -1451,6 +1493,8 @@ export function SettingsPanel() {
                           tone: 'danger',
                         });
                         if (!confirmed) return;
+                        setWindsurfLocalImportCandidates([]);
+                        setSelectedWindsurfCandidate('');
                         invalidateProviderCatalogRefresh('windsurf');
                         setWindsurfBusy(true);
                         try {
@@ -1501,9 +1545,39 @@ export function SettingsPanel() {
                     ? '浏览器会显示一次性 token；它只发送给本机主进程换取长期凭据，不写入 Redux、localStorage 或日志。'
                     : windsurfStatus?.error || '浏览器 token 登录和本机 Devin/Windsurf 导入是两条独立入口；只有点击按钮才会读取本机客户端状态。'}
               </span>
-              {windsurfLocalImportMessage && (
-                <span className="setting-hint">{windsurfLocalImportMessage}</span>
-              )}
+                {windsurfLocalImportMessage && (
+                  <span className="setting-hint">{windsurfLocalImportMessage}</span>
+                )}
+                {windsurfLocalImportCandidates.length > 1 && (
+                  <fieldset className="windsurf-import-candidates" disabled={windsurfBusy}>
+                    <legend>选择要导入的本机账号</legend>
+                    {windsurfLocalImportCandidates.map(candidate => (
+                      <label className="windsurf-import-candidate" key={candidate.candidateFingerprint}>
+                        <input
+                          type="radio"
+                          name="windsurf-local-import-candidate"
+                          value={candidate.candidateFingerprint}
+                          checked={selectedWindsurfCandidate === candidate.candidateFingerprint}
+                          onChange={() => setSelectedWindsurfCandidate(candidate.candidateFingerprint)}
+                        />
+                        <span className="windsurf-import-candidate-copy">
+                          <strong>{candidate.accountLabel || '未命名账号'}</strong>
+                          <small>{candidate.source}</small>
+                        </span>
+                      </label>
+                    ))}
+                    <div className="windsurf-import-candidate-actions">
+                      <button
+                        type="button"
+                        className="settings-btn"
+                        disabled={!selectedWindsurfCandidate || windsurfBusy}
+                        onClick={() => void handleWindsurfLocalImport(selectedWindsurfCandidate)}
+                      >
+                        导入所选账号
+                      </button>
+                    </div>
+                  </fieldset>
+                )}
             </div>
             <div className="setting-item">
               <label>测试连接</label>

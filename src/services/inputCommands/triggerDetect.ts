@@ -63,7 +63,7 @@ export function detectTrigger(text: string, caretPos: number): TriggerDetectResu
   const triggerChar = text[i];
   const query = text.slice(i + 1, caret);
   // query 内不应含空白（理论上前面循环已保证，这里二次防御：含空白即视为已离开 token）。
-  if (/[\s　]/.test(query)) return null;
+  if (/[\s\u3000]/.test(query)) return null;
 
   if (triggerChar === '@') {
     return detectAt(text, i, query);
@@ -99,6 +99,6 @@ function detectAt(text: string, at: number, query: string): TriggerDetectResult 
 function detectSlash(text: string, slash: number, query: string): TriggerDetectResult | null {
   // `/` 之前的所有字符必须全是空白（即 `/` 处于整条输入去前导空白后的开头）。
   const before = text.slice(0, slash);
-  if (before.length > 0 && !/^[\s　]*$/.test(before)) return null;
+  if (before.length > 0 && !/^[\s\u3000]*$/.test(before)) return null;
   return { kind: 'slash', query, tokenStart: slash };
 }

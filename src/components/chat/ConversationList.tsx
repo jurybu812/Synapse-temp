@@ -15,6 +15,7 @@ import { executionRegistry } from '@/services/executionRegistry';
 import { setCurrentModel, setMode, setReasoningEffort } from '@/store/slices/agentSettings';
 import { exitWorktree } from '@/store/slices/worktreeSession';
 import { addNotification } from '@/store/slices/notifications';
+import { buildWorkspaceMoveTargets, workspacePathKey } from '@/store/slices/workspace';
 import {
   AUTOSAVE_ID,
   beginConversationSwitch,
@@ -107,10 +108,7 @@ export function ConversationList() {
   } = useConversationManager();
   // 「移动到…」候选工作区：当前工作区（若有）置顶 + recentPaths 去重，全部以 path 为键。
   const moveTargets = useMemo<string[]>(() => {
-    const set = new Set<string>();
-    if (workspaceCurrentPath) set.add(workspaceCurrentPath);
-    recentPaths.forEach(p => { if (p) set.add(p); });
-    return [...set];
+    return buildWorkspaceMoveTargets(workspaceCurrentPath, recentPaths);
   }, [workspaceCurrentPath, recentPaths]);
   const conversations = useAppSelector((s) => s.conversationHistory.conversations);
   const selectedId = useAppSelector((s) => s.conversationHistory.selectedId);
@@ -913,18 +911,23 @@ export function ConversationList() {
                   >
                     <Globe size={12} /> 全局（无归属）
                   </button>
-                  {moveTargets.map(path => (
-                    <button
-                      key={path}
-                      className={`conv-move-option ${conv.workspacePath === path ? 'active' : ''}`}
-                      onClick={() => void handleMoveConversation(conv.id, path)}
-                      title={path}
-                    >
-                      <FolderInput size={12} />
-                      <span className="conv-move-option-label">{workspaceLabel(path)}</span>
-                      {path === workspaceCurrentPath && <small>当前</small>}
-                    </button>
-                  ))}
+                  {moveTargets.map(path => {
+                    const pathKey = workspacePathKey(path);
+                    const activeKey = workspacePathKey(conv.workspacePath);
+                    const currentKey = workspacePathKey(workspaceCurrentPath);
+                    return (
+                      <button
+                        key={pathKey}
+                        className={`conv-move-option ${activeKey === pathKey ? 'active' : ''}`}
+                        onClick={() => void handleMoveConversation(conv.id, path)}
+                        title={path}
+                      >
+                        <FolderInput size={12} />
+                        <span className="conv-move-option-label">{workspaceLabel(path)}</span>
+                        {currentKey === pathKey && <small>当前</small>}
+                      </button>
+                    );
+                  })}
                   {moveTargets.length === 0 && (
                     <div className="conv-move-empty">暂无可选工作区，先打开一个工作区</div>
                   )}

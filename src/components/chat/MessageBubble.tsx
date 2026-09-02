@@ -4,7 +4,7 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import 'katex/dist/katex.min.css';
 import { Copy, Check, User, Bot, Wrench, MessageSquare, Pencil, RefreshCw, Trash2, FilePlus, FilePenLine, FileX2, FileText, ExternalLink, ListChecks, Undo2, GitBranch, ChevronDown, ChevronUp, ChevronRight, Plus, Image as ImageIcon, AtSign } from 'lucide-react';
-import { memo, useDeferredValue, useState, useCallback, useEffect, useRef } from 'react';
+import { Fragment, memo, useDeferredValue, useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { ToolCallCard } from './ToolCallCard';
 import { WorkflowCard } from './WorkflowCard';
 import { ContextMenu, type MenuItem } from '@/components/ui/ContextMenu';
@@ -20,6 +20,37 @@ import type { RootState } from '@/store';
 import { confirmAction } from '@/services/confirmationCoordinator';
 
 type ToolCallInfo = ToolCall;
+
+const INITIAL_TOOL_CALL_WINDOW = 20;
+const TOOL_CALL_WINDOW_INCREMENT = 20;
+const INITIAL_ARTIFACT_WINDOW = 12;
+const ARTIFACT_WINDOW_INCREMENT = 12;
+
+function shouldPinToolCall(toolCall: ToolCallInfo): boolean {
+  return toolCall.status === 'pending'
+    || toolCall.status === 'running'
+    || toolCall.status === 'cancelling'
+    || toolCall.status === 'error'
+    || toolCall.status === 'unknown'
+    || Boolean(toolCall.unknownSideEffect);
+}
+
+function buildToolCallWindow(toolCalls: ToolCallInfo[] | undefined, olderRevealCount: number) {
+  const source = toolCalls ?? [];
+  const total = source.length;
+  const latestStartIndex = Math.max(0, total - INITIAL_TOOL_CALL_WINDOW);
+  const earliestRevealedIndex = Math.max(0, latestStartIndex - Math.max(0, olderRevealCount));
+  const entries = source
+    .map((toolCall, index) => ({ toolCall, index }))
+    .filter(({ toolCall, index }) => index >= earliestRevealedIndex || shouldPinToolCall(toolCall));
+  const hiddenCount = source.reduce((count, toolCall, index) => (
+    index < earliestRevealedIndex && !shouldPinToolCall(toolCall) ? count + 1 : count
+  ), 0);
+  const pinnedCount = source.reduce((count, toolCall, index) => (
+    index < earliestRevealedIndex && shouldPinToolCall(toolCall) ? count + 1 : count
+  ), 0);
+  return { entries, total, hiddenCount, pinnedCount, latestStartIndex };
+}
 
 interface FileDiffInfo {
   id: string;
@@ -172,6 +203,9 @@ function MessageBubbleImpl({ id, role, content, timestamp, model, isStreaming, h
   const [userMsgExpanded, setUserMsgExpanded] = useState(false);
   const [userMsgOverflow, setUserMsgOverflow] = useState(false);
   const userMsgContentRef = useRef<HTMLDivElement>(null);
+  const latestToolCallsRef = useRef<HTMLDivElement>(null);
+  const [olderToolCallCount, setOlderToolCallCount] = useState(0);
+  const [messageArtifactLimit, setMessageArtifactLimit] = useState(INITIAL_ARTIFACT_WINDOW);
   // ★ C6：editRef(textarea) 移除，改 editRichRef(RichTextInput)。
   const live = isStreaming || streamState === 'pending' || streamState === 'streaming';
   const historyMutationLocked = Boolean(historyActionsDisabled || live);
@@ -190,6 +224,32 @@ function MessageBubbleImpl({ id, role, content, timestamp, model, isStreaming, h
       : streamMode === 'off'
         ? 'Complete'
         : 'Thought';
+  const toolCallWindow = useMemo(
+    () => buildToolCallWindow(toolCalls, olderToolCallCount),
+    [toolCalls, olderToolCallCount],
+  );
+  const visibleArtifacts = useMemo(
+    () => (artifacts ?? []).slice(0, messageArtifactLimit),
+    [artifacts, messageArtifactLimit],
+  );
+  const hiddenArtifactCount = Math.max(0, (artifacts?.length ?? 0) - visibleArtifacts.length);
+
+  const handleLoadEarlierToolCalls = useCallback(() => {
+    setOlderToolCallCount(count => count + TOOL_CALL_WINDOW_INCREMENT);
+  }, []);
+
+  const handleJumpToLatestToolCalls = useCallback(() => {
+    setOlderToolCallCount(0);
+    requestAnimationFrame(() => latestToolCallsRef.current?.scrollIntoView({ block: 'nearest' }));
+  }, []);
+
+  const handleLoadMoreMessageArtifacts = useCallback(() => {
+    setMessageArtifactLimit(limit => limit + ARTIFACT_WINDOW_INCREMENT);
+  }, []);
+
+  const handleCollapseMessageArtifacts = useCallback(() => {
+    setMessageArtifactLimit(INITIAL_ARTIFACT_WINDOW);
+  }, []);
 
   useEffect(() => {
     if (!live) return;
@@ -200,6 +260,22 @@ function MessageBubbleImpl({ id, role, content, timestamp, model, isStreaming, h
   useEffect(() => {
     if (thinking?.collapsed !== undefined) setThinkingOpen(!thinking.collapsed);
   }, [thinking?.collapsed]);
+
+  useEffect(() => {
+    setOlderToolCallCount(count => Math.min(count, Math.max(0, (toolCalls?.length ?? 0) - INITIAL_TOOL_CALL_WINDOW)));
+  }, [toolCalls?.length]);
+
+  useEffect(() => {
+    setMessageArtifactLimit(limit => Math.min(
+      Math.max(INITIAL_ARTIFACT_WINDOW, limit),
+      Math.max(INITIAL_ARTIFACT_WINDOW, artifacts?.length ?? 0),
+    ));
+  }, [artifacts?.length]);
+
+  useEffect(() => {
+    setOlderToolCallCount(0);
+    setMessageArtifactLimit(INITIAL_ARTIFACT_WINDOW);
+  }, [id]);
 
   // ★ B4：测 user 消息内容是否超过折叠阈值（与 CSS .message-text-collapsible 折叠态 max-height 同值）。
   //   超高才显「展开」按钮；内容/编辑态变化后重测。editing 态不折叠（编辑框需完整展开）。
@@ -232,7 +308,7 @@ function MessageBubbleImpl({ id, role, content, timestamp, model, isStreaming, h
     onEdit?.(id, text, readyAtts, newTokens.length > 0 ? newTokens : undefined);
     setIsEditing(false);
     editAtt.markCommitted(); // 新上传草稿引用已随消息转移走，清记录不 release（refCount 守恒路径 E）。
-  }, [id, content, onEdit, editAtt]);
+  }, [id, onEdit, editAtt]);
 
   const handleCancelEdit = useCallback(() => {
     setIsEditing(false);
@@ -663,8 +739,8 @@ function MessageBubbleImpl({ id, role, content, timestamp, model, isStreaming, h
 
         {/* ★ show_artifact：AI 主动推的产物卡片（点开即在中部编辑器打开已存在文件），与 diffs 并列。 */}
         {artifacts && artifacts.length > 0 && (
-          <div className="message-artifacts">
-            {artifacts.map(art => {
+          <div className="message-artifacts" role="group" aria-label={`产物列表，共 ${artifacts.length} 个，当前显示 ${visibleArtifacts.length} 个`}>
+            {visibleArtifacts.map(art => {
               const fileName = art.label || art.path.split(/[\\/]/).pop() || art.path;
               return (
                 <button
@@ -679,6 +755,28 @@ function MessageBubbleImpl({ id, role, content, timestamp, model, isStreaming, h
                 </button>
               );
             })}
+            {hiddenArtifactCount > 0 && (
+              <button
+                className="artifact-chip artifact-window-chip"
+                onClick={handleLoadMoreMessageArtifacts}
+                aria-label={`显示更多产物，剩余 ${hiddenArtifactCount} 个`}
+                title={`还有 ${hiddenArtifactCount} 个产物未显示`}
+              >
+                <Plus size={14} />
+                <strong>显示更多</strong>
+                <span className="artifact-open">+{Math.min(ARTIFACT_WINDOW_INCREMENT, hiddenArtifactCount)}</span>
+              </button>
+            )}
+            {messageArtifactLimit > INITIAL_ARTIFACT_WINDOW && (
+              <button
+                className="artifact-chip artifact-window-chip"
+                onClick={handleCollapseMessageArtifacts}
+                aria-label={`收起产物列表到前 ${INITIAL_ARTIFACT_WINDOW} 个`}
+              >
+                <ChevronUp size={14} />
+                <strong>收起产物</strong>
+              </button>
+            )}
           </div>
         )}
 
@@ -711,9 +809,40 @@ function MessageBubbleImpl({ id, role, content, timestamp, model, isStreaming, h
 
         {/* Tool Call Cards */}
         {toolCalls && toolCalls.length > 0 && (
-          <div className="tool-calls-container">
-            {toolCalls.map((tc) => (
-              <ToolCallCard key={tc.id} toolCall={tc} onTaskRefresh={onRefreshToolTask} onTaskCancel={onCancelToolTask} />
+          <div className="tool-calls-container" role="group" aria-label={`工具调用列表，共 ${toolCallWindow.total} 条，当前显示 ${toolCallWindow.entries.length} 条`}>
+            {(toolCallWindow.hiddenCount > 0 || toolCallWindow.pinnedCount > 0 || olderToolCallCount > 0) && (
+              <div className="tool-call-window-controls">
+                <span className="tool-call-window-summary" aria-live="polite">
+                  显示 {toolCallWindow.entries.length}/{toolCallWindow.total} 条工具调用，保留最近 {Math.min(INITIAL_TOOL_CALL_WINDOW, toolCallWindow.total)} 条
+                  {toolCallWindow.pinnedCount > 0 ? `，另固定 ${toolCallWindow.pinnedCount} 条异常或未结束调用` : ''}
+                </span>
+                {toolCallWindow.hiddenCount > 0 && (
+                  <button
+                    className="tool-call-window-btn"
+                    onClick={handleLoadEarlierToolCalls}
+                    aria-label={`加载更早工具调用，剩余 ${toolCallWindow.hiddenCount} 条`}
+                  >
+                    <ChevronUp size={13} />
+                    加载更早 {Math.min(TOOL_CALL_WINDOW_INCREMENT, toolCallWindow.hiddenCount)} 条
+                  </button>
+                )}
+                {olderToolCallCount > 0 && (
+                  <button
+                    className="tool-call-window-btn"
+                    onClick={handleJumpToLatestToolCalls}
+                    aria-label="跳回最新工具调用"
+                  >
+                    <ChevronDown size={13} />
+                    跳回最新
+                  </button>
+                )}
+              </div>
+            )}
+            {toolCallWindow.entries.map(({ toolCall, index }) => (
+              <Fragment key={toolCall.id}>
+                {index === toolCallWindow.latestStartIndex && <div ref={latestToolCallsRef} className="tool-call-window-anchor" aria-hidden="true" />}
+                <ToolCallCard toolCall={toolCall} onTaskRefresh={onRefreshToolTask} onTaskCancel={onCancelToolTask} />
+              </Fragment>
             ))}
           </div>
         )}

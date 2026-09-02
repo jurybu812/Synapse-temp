@@ -10,8 +10,11 @@ assert.match(main, /QUIT_CLEANUP_TIMEOUT_MS\s*=\s*8_000/);
 assert.match(main, /Promise\.race\(\[/);
 assert.match(main, /Promise\.allSettled\(\[shutdownToolTasks\(\), shutdownCommandTasks\(\), shutdownAllMCP\(\)\]\)/);
 assert.ok(main.indexOf('registerConfigHandlers();') < main.indexOf('createWindow();'), 'IPC handlers must exist before the first renderer loads');
-assert.match(mcp, /signal:\s*AbortSignal\.timeout\(timeout\)/);
-assert.match(mcp, /signal:\s*AbortSignal\.timeout\(5000\)/);
+assert.match(
+  mcp,
+  /signal:\s*AbortSignal\.any\(\[\s*lifecycleSignal,\s*AbortSignal\.timeout\(timeout\),?\s*\]\)/,
+);
+assert.match(mcp, /signal:\s*AbortSignal\.timeout\(3000\)/);
 assert.match(mcp, /if \(!response\.ok\) throw new Error\(`MCP http \$\{response\.status\} \$\{method\}`\)/);
 
 console.log('Runtime shutdown static integration: all assertions passed');

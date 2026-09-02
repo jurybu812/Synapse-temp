@@ -191,15 +191,13 @@ async function writeReviewFile(
 
 async function deleteReviewFile(diff: FileDiffSummary, expectedContent: string): Promise<void> {
   await assertReviewFileExpected(diff, expectedContent, '删除');
-  await fileSystem.writeFile(
+  await fileSystem.deleteFile(
     diff.path,
-    expectedContent,
     diff.contextId,
     diff.conversationId,
     undefined,
     expectedContentOption(expectedContent),
   );
-  await fileSystem.deleteFile(diff.path, diff.contextId, diff.conversationId);
 }
 
 async function applyReviewMutation(
@@ -358,7 +356,7 @@ export interface FileRollbackTransaction {
   compensate: () => Promise<void>;
 }
 
-interface RollbackFileState extends FileContentState {}
+type RollbackFileState = FileContentState;
 
 async function readRollbackFileState(
   diff: FileDiffSummary,
@@ -488,15 +486,13 @@ async function executePreparedFileRollback(
   }, '回退');
   onMutationStart();
   if (prepared.action === 'delete') {
-    await fileSystem.writeFile(
+    await fileSystem.deleteFile(
       prepared.targetPath,
-      prepared.originalContent,
       undefined,
       undefined,
       undefined,
       expectedContentOption(prepared.originalContent),
     );
-    await fileSystem.deleteFile(prepared.targetPath);
     return;
   }
   await fileSystem.writeFile(
@@ -521,15 +517,13 @@ async function restorePreparedFileRollback(prepared: PreparedFileDiffRollback): 
     throw new Error(`文件在回退事务后又被修改，已停止补偿: ${prepared.diff.path}`);
   }
   if (!prepared.originalExists) {
-    await fileSystem.writeFile(
+    await fileSystem.deleteFile(
       prepared.targetPath,
-      prepared.appliedContent,
       undefined,
       undefined,
       undefined,
       expectedContentOption(prepared.appliedContent),
     );
-    await fileSystem.deleteFile(prepared.targetPath);
     return;
   }
   await fileSystem.writeFile(

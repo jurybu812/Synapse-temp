@@ -20,13 +20,13 @@ export interface DispatchResult {
 
 /** 解析 `/name rest` → { name, rest }；非 `/` 开头返回 null。 */
 function splitNameAndRest(input: string): { name: string; rest: string } | null {
-  const trimmed = input.replace(/^[\s　]+/, ''); // 去前导空白（含全角空格）
+  const trimmed = input.replace(/^[\s\u3000]+/, ''); // 去前导空白（含全角空格）
   if (!trimmed.startsWith('/')) return null;
   // 去掉前导斜杠（容错 //collect 写法），再取命令名 = 到第一个空白前的连续非空白。
   const body = trimmed.replace(/^\/+/, '');
   const m = body.match(/^(\S+)([\s\S]*)$/);
   if (!m) return { name: '', rest: '' };
-  return { name: m[1], rest: (m[2] ?? '').replace(/^[\s　]+/, '') };
+  return { name: m[1], rest: (m[2] ?? '').replace(/^[\s\u3000]+/, '') };
 }
 
 /**
@@ -67,7 +67,7 @@ function parseArgs(cmd: SlashCommand, rest: string): Record<string, string> {
     const quoted = remaining.match(/^(["'「『“‘`])([\s\S]*?)(["'」』”’`])([\s\S]*)$/);
     if (quoted && QUOTE_CLOSE[quoted[1]] === quoted[3]) {
       parsed[arg.name] = quoted[2];
-      remaining = (quoted[4] ?? '').replace(/^[\s　]+/, '');
+      remaining = (quoted[4] ?? '').replace(/^[\s\u3000]+/, '');
       continue;
     }
     const m = remaining.match(/^(\S+)([\s\S]*)$/);
@@ -76,7 +76,7 @@ function parseArgs(cmd: SlashCommand, rest: string): Record<string, string> {
       continue;
     }
     parsed[arg.name] = m[1];
-    remaining = (m[2] ?? '').replace(/^[\s　]+/, '');
+    remaining = (m[2] ?? '').replace(/^[\s\u3000]+/, '');
   }
   return parsed;
 }

@@ -60,6 +60,12 @@ vm.runInNewContext(output, {
 });
 
 const checkpoint = moduleRef.exports;
+assert.equal(checkpoint.clampChatScrollAnchorOffset(24, 900), 24);
+assert.equal(checkpoint.clampChatScrollAnchorOffset(-6000, 900), -900);
+assert.equal(checkpoint.isChatScrollAnchorOffsetWithinViewportBand(24, 900), true);
+assert.equal(checkpoint.isChatScrollAnchorOffsetWithinViewportBand(-6000, 900), false);
+assert.equal(checkpoint.clampChatScrollTopForRestore(6200, 14000, 900), 6200);
+assert.equal(checkpoint.clampChatScrollTopForRestore(16000, 14000, 900), 13100);
 desktopCheckpoint = {
   version: 1,
   activeConversationId: 'stale-desktop',
@@ -102,6 +108,24 @@ assert.equal(checkpoint.readCheckpointAgentTab(), 'plan');
 assert.equal(checkpoint.readCheckpointChatScroll('conversation-a').scrollTop, 123);
 checkpoint.writeAgentSessionViewport({
   conversationId: 'conversation-a',
+  activeAgentTab: 'plan',
+  chatScroll: {
+    scrollTop: 222,
+    atBottom: false,
+    visibleUnitStart: 12,
+    visibleUnitEnd: 44,
+    anchor: { kind: 'step', id: 'step-7', boundaryId: 'boundary-1', offset: 24 },
+    updatedAt: 120,
+  },
+});
+assert.deepEqual(checkpoint.readCheckpointChatScroll('conversation-a').anchor, {
+  kind: 'step',
+  id: 'step-7',
+  boundaryId: 'boundary-1',
+  offset: 24,
+});
+checkpoint.writeAgentSessionViewport({
+  conversationId: 'conversation-a',
   activeAgentTab: 'context',
   tabScrollTop: { plan: 456 },
 });
@@ -130,6 +154,25 @@ checkpoint.writeAgentSessionViewport({
 assert.equal(checkpoint.readCheckpointActiveConversationId(), 'conversation-b');
 assert.equal(checkpoint.readCheckpointAgentTab(), 'context');
 
+values.clear();
+desktopCheckpoint = {
+  version: 1,
+  activeConversationId: 'conversation-a',
+  activeAgentTab: 'chat',
+  updatedAt: 300,
+};
+assert.equal(localStorage.getItem('synapse_active_conversation_id'), null);
+checkpoint.writeAgentSessionViewport({
+  conversationId: 'conversation-b',
+  activeAgentTab: 'context',
+  tabScrollTop: { plan: 654 },
+  sync: true,
+});
+assert.equal(checkpoint.readCheckpointActiveConversationId(), 'conversation-a');
+assert.equal(checkpoint.readCheckpointAgentTab(), 'chat');
+assert.equal(checkpoint.readCheckpointTabScroll('conversation-b', 'plan'), 654);
+assert.equal(desktopCheckpoint.activeConversationId, 'conversation-a');
+
 localStorage.removeItem('synapse_active_conversation_id');
 checkpoint.writeCheckpointActiveConversationId(null);
 checkpoint.writeAgentSessionViewport({
@@ -150,6 +193,8 @@ assert.ok(desktopCheckpoint);
 
 localStorage.setItem('synapse:chat-scroll:autosave-current', JSON.stringify({ scrollTop: 88 }));
 checkpoint.promoteAgentSessionCheckpoint('autosave-current', 'conversation-c');
+assert.equal(checkpoint.readCheckpointActiveConversationId(), 'conversation-c');
+assert.equal(localStorage.getItem('synapse_active_conversation_id'), 'conversation-c');
 assert.equal(checkpoint.readCheckpointChatScroll('conversation-c').scrollTop, 88);
 assert.equal(checkpoint.readCheckpointTabScroll('conversation-c', 'plan'), 0);
 assert.ok(localStorage.getItem('synapse:chat-scroll:conversation-c'));
@@ -158,6 +203,14 @@ localStorage.setItem('synapse:agent-tab-scroll:autosave-current', JSON.stringify
 checkpoint.promoteAgentSessionCheckpoint('autosave-current', 'conversation-d');
 assert.equal(checkpoint.readCheckpointTabScroll('conversation-d', 'plan'), 321);
 
+checkpoint.writeCheckpointActiveConversationId('conversation-old');
+localStorage.setItem('synapse_active_conversation_id', 'conversation-old');
+checkpoint.promoteAgentSessionCheckpoint('conversation-old', 'conversation-new');
+assert.equal(checkpoint.readCheckpointActiveConversationId(), 'conversation-new');
+assert.equal(localStorage.getItem('synapse_active_conversation_id'), 'conversation-new');
+
+localStorage.removeItem('synapse_active_conversation_id');
+checkpoint.writeCheckpointActiveConversationId(null);
 checkpoint.writeAgentSessionViewport({
   conversationId: 'autosave-current',
   activeAgentTab: 'context',

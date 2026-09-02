@@ -11,7 +11,7 @@ import {
   setMessageStreamState, setMessageReconnect, setStreaming, setCompacting,
   clearStreamingContent, setTitle, setTokenUsage, setProjectedTokenCount,
   addAssistantRun, addRunEvent, resetRunStreamEvents, addMessageDiff, addMessageArtifact, recordFileSnapshot, updateToolCallStatus, reconcileToolTaskStatus,
-  appendTaskStep, endTaskBoundary, dequeueInterrupt, selectActiveConversation, selectConversationById,
+  appendTaskStep, beginTaskBoundary, endTaskBoundary, dequeueInterrupt, selectActiveConversation, selectConversationById,
   type AttachmentRef, type MessageContentPart, type StreamModeUsed, type QueuedMessage,
   type Message,
 } from '../store/slices/conversation';
@@ -49,7 +49,8 @@ import { executionRegistry } from './executionRegistry';
 import { renderToolResultForModel, type ToolResult } from './toolResult';
 import { resolveProviderModel } from './providerModelRuntime';
 import { platform } from '@/platform';
-import { queueDrainCoordinator } from './queueDrainCoordinator';
+import { queueDrainCoordinator, interruptContinuationFromBoundary, type InterruptContinuationTaskBoundary } from './queueDrainCoordinator';
+import { captureExecutionWorkspaceSnapshot, releaseExecutionWorkspaceSnapshot } from './fileSystem';
 
 /**
  * ★ M5-BPC-4：解析生效硬压缩阈值 = 本对话覆盖 ?? 全局 agentSettings.bpc.compactThreshold ?? COMPRESSION_THRESHOLD(0.9)。
@@ -122,6 +123,17 @@ async function persistRuntimeConversationSnapshot(conversationId: string): Promi
     taskHeadline: conversation.taskHeadline,
     timestamp: Date.now(),
   }, { runtimeOwned: true });
+}
+
+function interruptContinuationHeadline(continuation: InterruptContinuationTaskBoundary): string {
+  const prior = continuation.previousHeadline?.trim() || '插队前任务';
+  return `插队后继续：${prior}`;
+}
+
+function interruptContinuationSummary(continuation: InterruptContinuationTaskBoundary): string {
+  const priorSummary = continuation.previousSummary?.trim();
+  const suffix = priorSummary ? `原概述：${priorSummary}` : '后续工具、进度和收口写入这张 continuation 边界。';
+  return `延续任务边界 ${continuation.previousBoundaryId}；用户插队消息已放在两张任务卡之间。${suffix}`;
 }
 
 type CompressionAppendResult = {
@@ -722,6 +734,35 @@ export async function readRecordAfterReadyPublication(
   return record;
 }
 
+export function applyReadyRecordToActiveRequest(
+  apiMessages: ChatMessage[],
+  recordMd: string,
+): ChatMessage[] {
+  if (!recordMd || apiMessages.length === 0) return apiMessages;
+
+  const roundStarts: number[] = [];
+  let hasUserRound = false;
+  let modelStepSinceUser = true;
+  for (let index = 0; index < apiMessages.length; index += 1) {
+    const role = apiMessages[index]?.role;
+    if (role === 'tool') continue;
+    if (role === 'user') {
+      if (!hasUserRound || modelStepSinceUser) roundStarts.push(index);
+      hasUserRound = true;
+      modelStepSinceUser = false;
+      continue;
+    }
+    if (hasUserRound) modelStepSinceUser = true;
+  }
+
+  const keepFromIndex = roundStarts[Math.max(0, roundStarts.length - 2)] ?? apiMessages.length;
+  return [
+    apiMessages[0],
+    { role: 'system', content: `${RECORD_INJECTION_PREFIX}${recordMd}` },
+    ...apiMessages.slice(keepFromIndex),
+  ];
+}
+
 /**
  * ★ R-L5 token 硬闸（设计C）：组装 apiHistory 前的【危险态兜底】，防 record 注入前缀撑爆上下文窗口。
  *
@@ -1050,6 +1091,7 @@ export class AgentLoop {
       attachments?: AttachmentRef[];
       richTokens?: import('@/services/inputCommands/richInput/types').ExtractedToken[];
     }>;
+    continuationTaskBoundary?: InterruptContinuationTaskBoundary;
     onUserMessagesAccepted?: () => void;
     /**
      * ★ M6 收尾 D1：发送时 RichTextInput.extract() 产出的有序 atomic token，仅用于编辑历史消息时无损还原
@@ -1111,8 +1153,10 @@ export class AgentLoop {
       : this.ownerId
         ? createExecutionContext(execContextId, this.ownerId)
         : createExecutionContext(execContextId, `legacy:${execContextId}`);
+    const executionWorkspaceContextId = this.executionContext.ownerId;
     try {
     await executionRegistry.activateOwner(this.executionContext.ownerId, this.executionContext.runId);
+    await captureExecutionWorkspaceSnapshot(executionWorkspaceContextId, this.executionContext.runId, this.runConvId!);
     if (!this.running) return;
     this.client.updateConfig({
       conversationId: this.runConvId!,
@@ -1143,6 +1187,26 @@ export class AgentLoop {
     const rootState = store.getState() as RootState;
     const state = selectConversationById(rootState, this.runConvId!);
     const currentModel = state.model || (rootState as any).agentSettings?.currentModel || '';
+    const beginInterruptContinuationTaskBoundary = (
+      continuation: InterruptContinuationTaskBoundary | undefined,
+      anchorMessageId: string | undefined,
+    ): string | null => {
+      if (!continuation?.previousBoundaryId || !anchorMessageId) return null;
+      if (!this.executionContext || !executionRegistry.isActiveRun(this.executionContext)) return null;
+      const boundaryId = generateId('tb');
+      store.dispatch(beginTaskBoundary({
+        id: boundaryId,
+        headline: interruptContinuationHeadline(continuation),
+        summary: interruptContinuationSummary(continuation),
+        anchorMessageId,
+        continuationOfId: continuation.previousBoundaryId,
+        continuationReason: 'interrupt',
+        continuationIndex: continuation.continuationIndex,
+        at: Date.now(),
+        conversationId: this.runConvId!,
+      }));
+      return boundaryId;
+    };
     const messages: ChatMessage[] = state.messages
       .filter((m: any) => m.role !== 'tool') // tool 结果消息用 agentLoop 内部管理
       .map(toChatMessage);
@@ -1161,6 +1225,8 @@ export class AgentLoop {
 
     // Add user message(s). A drained queue is one human turn: keep each queued entry as an independent,
     // editable bubble while issuing only one subsequent model request for the whole batch.
+    const acceptedUserMessageIds: string[] = [];
+    let initialContinuationNotice: string | null = null;
     if (!opts?.skipUserMessage) {
       const acceptedAt = Date.now();
       for (const [index, pendingUserMessage] of userMessagesForRun.entries()) {
@@ -1175,6 +1241,7 @@ export class AgentLoop {
           model: currentModel,
         };
         store.dispatch(addMessage({ message: userMsg, conversationId: this.runConvId! }));
+        acceptedUserMessageIds.push(userMsg.id);
 
         const subtitleSource = pendingUserMessage.content.trim();
         if (subtitleSource) {
@@ -1196,6 +1263,13 @@ export class AgentLoop {
         }
       }
       opts?.onUserMessagesAccepted?.();
+      const continuationBoundaryId = beginInterruptContinuationTaskBoundary(
+        opts?.continuationTaskBoundary,
+        acceptedUserMessageIds[acceptedUserMessageIds.length - 1],
+      );
+      if (continuationBoundaryId && opts?.continuationTaskBoundary) {
+        initialContinuationNotice = `【用户插队续接】系统已在插队消息之后建立新的 continuation task_boundary：${continuationBoundaryId}，它延续 ${opts.continuationTaskBoundary.previousBoundaryId}。后续若继续工具工作，请直接调用 update_task_progress() 写入进度，完成时调用 end_task_boundary() 收口；不要为同一段续接重复 begin_task_boundary。`;
+      }
     }
     // Build system prompt with mode context
     const workspaceName = (rootState as any).workspace?.name;
@@ -1393,6 +1467,14 @@ export class AgentLoop {
     // ★ M5-BPC-4：硬压缩阈值可配（本对话覆盖 ?? 全局 bpc.compactThreshold ?? 0.9）。下推 compressContext 与
     //   下方 overLimit truncate 阈值，使「90% 硬阈值」成为用户可调项（BPC 设置面板 / 本对话覆盖）。
     const effectiveCompactThreshold = resolveCompactThreshold(rootState, this.runConvId!);
+    const requestPressureRatio = modelContextWindow > 0 ? triggerTokens / modelContextWindow : 0;
+    // A cold-loaded or restored long conversation may already be above the soft BPC threshold even
+    // though no preceding Agent turn exists in this renderer to trigger the usual end-of-turn hook.
+    // Start the snapshot here as fire-and-forget while the request is still below the hard gate, so
+    // the main Provider/tool loop can proceed concurrently and the candidate can publish when idle.
+    if (requestPressureRatio < effectiveCompactThreshold) {
+      this.evaluateBpcWater(modelContextWindow, triggerTokens);
+    }
     const { wasCompressed, overLimitWithoutCompression } = compressContext(
       requestHistoryText,
       modelContextWindow,
@@ -1424,8 +1506,7 @@ export class AgentLoop {
     //      防「BPC 后台 appendBatch」与「硬压缩 appendBatch」对同一 record 双写竞争。discardCurrent 只丢内存快照，
     //      BPC 已落库的批是持久的——下方 compactNow 增量切片会从该批 stepEnd 续记，BPC 成果不浪费。
     {
-      const bpcRatio = modelContextWindow > 0 ? triggerTokens / modelContextWindow : 0;
-      const hitHardThreshold = wasCompressed || overLimitWithoutCompression || bpcRatio >= effectiveCompactThreshold;
+      const hitHardThreshold = wasCompressed || overLimitWithoutCompression || requestPressureRatio >= effectiveCompactThreshold;
       if (hitHardThreshold && bpcScheduler.isBusy(bpcConversationId)) {
         await bpcScheduler.discardCurrent(bpcConversationId, '撞硬压缩阈值，转同步压缩（防双写）');
         if (!this.running) return;
@@ -1534,6 +1615,9 @@ export class AgentLoop {
     // 尾部 user envelope 兼容老式 chat 协议，又不会写入 store/Record/Fork。这样工具结果之后的新请求也能看到最新元数据，
     // 同一次 streamChat 的自动重试保持完全相同，工具循环的下一次请求则获得新的当前时间。
     apiMessages = appendTailContext(apiMessages, openFilesSection);
+    if (initialContinuationNotice) {
+      apiMessages.push({ role: 'system', content: initialContinuationNotice });
+    }
     // ★ M2-S 任务1：发送前图片有效性预检剔除了无效图（损坏/非图片字节），提示用户——
     // 避免「历史里混进一张坏图 → 上游对整条请求整体 400 → 有效图与正常对话一起被拖垮」。
     if (restoreResult.skippedInvalidImages > 0) {
@@ -1615,9 +1699,9 @@ export class AgentLoop {
 
     let round = 0;
 
-    const endOwnedTaskBoundary = (aborted = false): boolean => {
+    const endOwnedTaskBoundary = (status: 'done' | 'interrupted' | 'aborted' = 'done'): boolean => {
       if (!this.executionContext || !executionRegistry.isActiveRun(this.executionContext)) return false;
-      store.dispatch(endTaskBoundary({ aborted, conversationId: this.runConvId! }));
+      store.dispatch(endTaskBoundary({ status, conversationId: this.runConvId! }));
       return true;
     };
 
@@ -1635,13 +1719,17 @@ export class AgentLoop {
     //   竞态守卫：消费前确认对话身份未切换（conversation.id 与 execContextId 一致），切了就不消费（防串台/误插新对话）。
     const drainInterruptMessages = async (): Promise<void> => {
       let consumedInterrupt = false;
+      let interruptedContinuation: InterruptContinuationTaskBoundary | undefined;
+      let lastInterruptMessageId: string | undefined;
       while (this.running) {
         const liveConv = selectConversationById(store.getState() as RootState, this.runConvId!);
         const pending = liveConv.interruptMessages as QueuedMessage[];
         if (!pending || pending.length === 0) break;
-        if (!consumedInterrupt && liveConv.taskBoundaries?.some((boundary: any) => boundary.status === 'active')) {
+        const activeBoundary = liveConv.taskBoundaries?.find((boundary: any) => boundary.status === 'active');
+        if (!consumedInterrupt && activeBoundary) {
           // 插队是一次清楚的人类中断：先把此前过程标为中止收口，再把新 user 消息放到卡片外。
-          endOwnedTaskBoundary(true);
+          const continuation = interruptContinuationFromBoundary(activeBoundary);
+          if (endOwnedTaskBoundary('interrupted')) interruptedContinuation = continuation;
         }
         // 身份守卫：对话已切换（execContextId 是 contextId 或入口对话 id）→ 不消费（队列也会被 setConversation 清，双保险）。
         const head = pending[0];
@@ -1656,9 +1744,10 @@ export class AgentLoop {
           error: undefined,
         }));
         // ① 进 UI：作为本 run 对话流里的一条 user 消息（含富文本 token，编辑回填无损还原）。★ #8：路由本 run 对话桶。
+        const interruptMessageId = generateId();
         store.dispatch(addMessage({
           message: {
-            id: generateId(),
+            id: interruptMessageId,
             role: 'user',
             content: head.text,
             contentParts: head.contentParts && head.contentParts.length > 0 ? head.contentParts : undefined,
@@ -1668,6 +1757,7 @@ export class AgentLoop {
           },
           conversationId: this.runConvId!,
         }));
+        lastInterruptMessageId = interruptMessageId;
         // ② 进 API：转 ChatMessage（contentParts 优先，纯文本兜底），单条还原附件 base64 后 push。
         const interruptChat: ChatMessage = head.contentParts && head.contentParts.length > 0
           ? { role: 'user', content: head.contentParts as any }
@@ -1681,9 +1771,12 @@ export class AgentLoop {
         consumedInterrupt = true;
       }
       if (consumedInterrupt) {
+        const continuationBoundaryId = beginInterruptContinuationTaskBoundary(interruptedContinuation, lastInterruptMessageId);
         apiMessages.push({
           role: 'system',
-          content: '【用户插队】以上用户消息在工具轮间插入，之前的任务边界已按中断收口。先响应最新指令；若仍需继续多步工具工作，请为后续阶段建立新的 task_boundary。',
+          content: continuationBoundaryId && interruptedContinuation
+            ? `【用户插队续接】以上用户消息在工具轮间插入；之前的任务边界 ${interruptedContinuation.previousBoundaryId} 已按 interrupted 收口，系统已在插队消息之后建立新的 continuation task_boundary：${continuationBoundaryId}。先响应最新指令；若仍需继续工具工作，请直接调用 update_task_progress() 写入这张续接边界，完成时调用 end_task_boundary() 收口，不要为同一段续接重复 begin_task_boundary。`
+            : '【用户插队】以上用户消息在工具轮间插入。先响应最新指令；若仍需继续多步工具工作，请建立新的 task_boundary。',
         });
       }
     };
@@ -1723,7 +1816,7 @@ export class AgentLoop {
         },
         conversationId: this.runConvId!,
       }));
-      endOwnedTaskBoundary(true);
+      endOwnedTaskBoundary('aborted');
       store.dispatch(addNotification({ type: 'warning', title, message, duration: 7000 }));
     };
 
@@ -1760,6 +1853,21 @@ export class AgentLoop {
       //   让 AI 本轮就看到。首轮队列必空（用户刚发、无机会插）→ no-op；工具轮 continue 回循环顶亦在此统一消费。
       await drainInterruptMessages();
       if (!this.running) break;
+      if (bpcScheduler.hasReadySnapshot(bpcConversationId)) {
+        const liveHistory = selectConversationById(store.getState() as RootState, bpcConversationId).messages
+          .filter((message: any) => message.role !== 'tool')
+          .map(toChatMessage);
+        const publishedPrefix = await bpcScheduler.takeReadyPrefix(
+          bpcConversationId,
+          identifyRounds(liveHistory).totalSteps,
+        );
+        if (!this.running) break;
+        if (publishedPrefix?.recordMd) {
+          apiMessages = applyReadyRecordToActiveRequest(apiMessages, publishedPrefix.recordMd);
+          const publishedRecord = await getRecord(bpcConversationId);
+          requestCompressionGeneration = String(publishedRecord?.revision ?? requestCompressionGeneration);
+        }
+      }
       const activeBoundaryNeedsFinalReminder = round > 1
         && apiMessages[apiMessages.length - 1]?.role === 'tool'
         && selectConversationById(store.getState() as RootState, this.runConvId!).taskBoundaries?.some((boundary: any) => boundary.status === 'active');
@@ -2157,7 +2265,7 @@ export class AgentLoop {
         const abortedAt = Date.now();
         // ★ H1（tb 卡住）：本轮被中止 → 收口未结束的 active task_boundary（aborted），否则边界永久 active、
         //   卡片一直挂着把后续每条消息都吞进去（"莫名一直在 task_boundary 状态"根因之一）。无 active 时 no-op。
-        endOwnedTaskBoundary(true);
+        endOwnedTaskBoundary('aborted');
         const visibleContent = selectConversationById(store.getState() as RootState, this.runConvId!)
           .messages.find((message: any) => message.id === assistantMessageId)?.content?.trim();
         if (!visibleContent) {
@@ -2259,7 +2367,7 @@ export class AgentLoop {
       } else if (responseError) {
         // ★ H1（tb 卡住）：API 失败等异常 → 收口 active task_boundary（aborted）。这是「AI 没机会调 end、
         //   用户也没点停止」时边界永久挂住的主因（图六 context canceled 场景）。无 active 时 no-op。
-        endOwnedTaskBoundary(true);
+        endOwnedTaskBoundary('aborted');
         const errorMsg = fullContent
           ? `${fullContent}\n\n⚠️ AI 请求失败，以上内容可能不完整: ${responseError}`
           : `⚠️ AI 请求失败: ${responseError}`;
@@ -2342,12 +2450,20 @@ export class AgentLoop {
             });
             const resultText = renderToolResultForModel(result);
             const stoppedAfterResult = !this.running || !executionRegistry.isActiveRun(callContext);
+            const ownerMessageStillExists = Boolean(
+              assistantMessageId
+              && selectConversationById(store.getState() as RootState, this.runConvId!).messages
+                .some(message => message.id === assistantMessageId),
+            );
             const stoppedResultText = result.unknownSideEffect
               ? '已停止；工具的最终副作用状态未知，相关文件变化仍会保留供审查'
               : '已停止；工具在停止后返回的结果未送入模型';
             // ★ medium#3/#5：按 execContextId 消费自己桶的改动，杜绝与并行子代理/其它上下文串台。
             const fileChanges = consumeTrackedFileChanges(callContext.callId);
-            for (const change of fileChanges) {
+            // 历史操作原则上会等旧 run 完全退出；这里再做最后一道归属闸。若 owner message 已被
+            // 其它异常路径移除，绝不能把迟到结果写成无人可见、却仍可接受/拒绝的孤儿 Diff。
+            const attributableFileChanges = ownerMessageStillExists ? fileChanges : [];
+            for (const change of attributableFileChanges) {
               store.dispatch(recordFileSnapshot({ snapshot: change.snapshot, conversationId: this.runConvId! }));
               if (assistantMessageId) {
                 store.dispatch(addMessageDiff({ messageId: assistantMessageId, diff: change.diff, conversationId: this.runConvId! }));
@@ -2366,8 +2482,8 @@ export class AgentLoop {
             }
             // ★ #4：本批文件改动落地后，刷新「正打开这些文件」的 editor tab（clean 自动重读盘同步 / dirty 提示不覆盖）。
             //   dynamic import 局部化（与本文件 import('./extensionManager') 同范式）；内部自带 try/catch，失败不影响主流程。
-            if (fileChanges.length > 0) {
-              void import('./openTabSync').then(m => m.refreshOpenTabsForChanges(fileChanges)).catch(() => { /* 刷新失败静默 */ });
+            if (attributableFileChanges.length > 0) {
+              void import('./openTabSync').then(m => m.refreshOpenTabsForChanges(attributableFileChanges)).catch(() => { /* 刷新失败静默 */ });
             }
             // ★ show_artifact：与文件改动同口径——按 execContextId 消费自己桶的产物卡片，挂到当前 assistant 消息上。
             //   artifact 只是「打开已存在文件」的入口（无 diff/snapshot/审阅），故只 addMessageArtifact，不发 file_change 事件。
@@ -2412,7 +2528,7 @@ export class AgentLoop {
               tc.function.arguments,
               stoppedAfterResult ? 'cancelled' : result.status,
               (stoppedAfterResult ? stoppedResultText : resultText).slice(0, 4000),
-              fileChanges.length,
+              attributableFileChanges.length,
               artifacts.length,
             ]));
             if (!this.running) break;
@@ -2458,7 +2574,7 @@ export class AgentLoop {
         }
         if (!this.running) {
           const stoppedAt = Date.now();
-          endOwnedTaskBoundary(true);
+          endOwnedTaskBoundary('aborted');
           store.dispatch(addRunEvent({
             event: {
               id: generateId('evt'),
@@ -2502,7 +2618,13 @@ export class AgentLoop {
         toolsTokens,
       ));
       // No tool calls = conversation complete
-      endOwnedTaskBoundary();
+      const completionBucket = selectConversationById(store.getState() as RootState, this.runConvId!);
+      const hasPendingCompletionInterrupt = (completionBucket.interruptMessages?.length ?? 0) > 0;
+      const pendingCompletionContinuation = hasPendingCompletionInterrupt
+        ? interruptContinuationFromBoundary(completionBucket.taskBoundaries?.find((boundary: any) => boundary.status === 'active'))
+        : undefined;
+      queueDrainCoordinator.rememberInterruptContinuation(this.runConvId!, pendingCompletionContinuation);
+      endOwnedTaskBoundary(hasPendingCompletionInterrupt ? 'interrupted' : 'done');
       completedNaturally = true;
       break;
     }
@@ -2533,6 +2655,7 @@ export class AgentLoop {
       const completedContext = this.executionContext;
       const completedConversationId = this.runConvId!;
       const ownsCurrentRun = completedContext ? executionRegistry.isActiveRun(completedContext) : false;
+      if (completedContext) releaseExecutionWorkspaceSnapshot(executionWorkspaceContextId, completedContext.runId);
       try {
       await persistRuntimeConversationSnapshot(completedConversationId).catch(() => undefined);
       this.setRunning(false);

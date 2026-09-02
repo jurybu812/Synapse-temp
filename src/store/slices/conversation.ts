@@ -5,6 +5,7 @@ import type { EditorFileType } from '@/services/editorFileTypes';
 //   fileChangeTracker 对本文件是 `import type`（运行时擦除），此处反向导入纯函数无运行时循环依赖。
 import { countLineChanges, buildDiffHunks } from '@/services/fileChangeTracker';
 import { findMergeableMessageDiffIndex } from '@/services/diffReviewLedger';
+import { diffReviewIdentityPath, normalizeDiffPath as normalizeReviewPath, type DiffReviewPathCarrier } from '@/services/diffReviewPath';
 // ★ #8 byId 真并发：AUTOSAVE_ID 作为合法 bucket key（新对话 id=null 时统一用它当桶键，与
 //   execContextId 回退口径 `this.contextId || conversation.id || AUTOSAVE_ID` 一致）。本文件 re-export 供同口径复用。
 import { AUTOSAVE_ID } from '@/services/conversationPersistence';
@@ -84,11 +85,14 @@ export interface TaskBoundary {
   id: string;
   headline: string;
   summary: string;
-  status: 'active' | 'done' | 'aborted';
+  status: 'active' | 'done' | 'interrupted' | 'aborted';
   startedAt: number;          // ms
   endedAt?: number;           // done/aborted 时回填
   anchorMessageId?: string;   // 边界【开始】锚定的 assistant 消息 id（卡片吞消息区间上界）
   endAnchorMessageId?: string;// ★ 边界【收口】时刻最后一条消息 id（卡片吞消息区间下界；active 未收口=延伸到当前末尾）
+  continuationOfId?: string;  // 用户插队后自动续开的边界：指向被 interrupted 收口的上一张边界
+  continuationReason?: 'interrupt' | string;
+  continuationIndex?: number;
   startRound?: number;        // 对齐 M5-2 轮次地基（可选，首版可不填）
   endRound?: number;
   steps: TaskBoundaryStep[];
@@ -105,6 +109,7 @@ export interface TaskHeadline {
 export interface FileDiffSummary {
   id: string;
   path: string;
+  reviewPath?: string;
   changeType: 'created' | 'edited' | 'deleted';
   additions: number;
   deletions: number;
@@ -119,6 +124,8 @@ export interface FileDiffSummary {
   contextId?: string;
   /** 产生此 diff 的对话 id。后台对话切走后，接受/拒绝仍据此解析原对话工作区，不能跟随当前界面漂移。 */
   conversationId?: string;
+  /** 产生此 diff 时的工作区根。用于区分不同工作区下相同 reviewPath，避免切换工作区后旧 Diff 与新 Diff 串线。 */
+  workspaceRoot?: string | null;
   /** ★ #6/#10 合并：累积 diff 链上「最早那次写之前」的快照 id / before hash。同一文件多次写合并成一条时，
    *  before 基线恒取这个最早快照（而非相邻快照），保证 accept 落最新内容、reject 回退到【最初态】非中间态。
    *  旧 diff 无此字段 → 合并逻辑 `?? snapshotId/beforeHash` 兜底降级，向后兼容。 */
@@ -324,6 +331,10 @@ export interface PerConversation {
   id: string;
   title: string;
   messages: Message[];
+  // 仅供渲染层识别消息拓扑/文件投影变化；正文流式增量不递增，避免每帧重建整段长对话。
+  messageTopologyRevision: number;
+  // 仅供渲染层识别 task_boundary 覆盖区间变化；steps/headline/summary 内容变化不递增。
+  taskBoundaryTopologyRevision: number;
   assistantRuns: Record<string, AssistantRun>;
   fileSnapshots: Record<string, FileSnapshot>;
   pendingDiffs: FileDiffSummary[];
@@ -392,6 +403,8 @@ function emptyBucket(id: string): PerConversation {
     id,
     title: '新对话',
     messages: [],
+    messageTopologyRevision: 0,
+    taskBoundaryTopologyRevision: 0,
     assistantRuns: {},
     fileSnapshots: {},
     pendingDiffs: [],
@@ -424,6 +437,14 @@ function invalidateTokenProjection(bucket: PerConversation, preservePrior = fals
   bucket.tokenCount = 0;
   bucket.tokenCountSource = 'none';
   bucket.tokenUsage = null;
+}
+
+function bumpMessageTopologyRevision(bucket: PerConversation): void {
+  bucket.messageTopologyRevision = (bucket.messageTopologyRevision ?? 0) + 1;
+}
+
+function bumpTaskBoundaryTopologyRevision(bucket: PerConversation): void {
+  bucket.taskBoundaryTopologyRevision = (bucket.taskBoundaryTopologyRevision ?? 0) + 1;
 }
 
 function normalizeThresholdOverride(value: unknown, min: number, max: number): number | undefined {
@@ -482,12 +503,24 @@ function bucketOf(state: ConversationState, conversationId?: string): PerConvers
 function clampTaskBoundariesAfterTruncation(bucket: PerConversation) {
   if (!bucket.taskBoundaries || bucket.taskBoundaries.length === 0) return;
   const ids = new Set(bucket.messages.map(m => m.id));
+  const lastMessageId = bucket.messages[bucket.messages.length - 1]?.id;
   const now = Date.now();
+  const previousCount = bucket.taskBoundaries.length;
   bucket.taskBoundaries = bucket.taskBoundaries.filter(b => !!b.anchorMessageId && ids.has(b.anchorMessageId));
+  let changed = bucket.taskBoundaries.length !== previousCount;
   for (const b of bucket.taskBoundaries) {
-    if (b.endAnchorMessageId && !ids.has(b.endAnchorMessageId)) b.endAnchorMessageId = undefined;
-    if (b.status === 'active') { b.status = 'done'; b.endedAt = now; }
+    if (b.endAnchorMessageId && !ids.has(b.endAnchorMessageId)) {
+      b.endAnchorMessageId = undefined;
+      changed = true;
+    }
+    if (b.status === 'active') {
+      b.status = 'done';
+      b.endedAt = now;
+      if (lastMessageId) b.endAnchorMessageId = lastMessageId;
+      changed = true;
+    }
   }
+  if (changed) bumpTaskBoundaryTopologyRevision(bucket);
 }
 
 function textToContentParts(content: string): MessageContentPart[] {
@@ -650,12 +683,35 @@ function summarizeBlockStatus(hunk: FileDiffHunk): NonNullable<FileDiffHunk['sta
 }
 
 function summarizeDiffStatus(diff: FileDiffSummary): FileDiffSummary['status'] {
+  if (diff.status === 'superseded') return 'superseded';
   const hunks = diff.hunks ?? [];
   if (hunks.length === 0) return diff.status;
   if (hunks.every(hunk => hunk.status === 'accepted')) return 'accepted';
   if (hunks.every(hunk => hunk.status === 'rejected')) return 'rejected';
   if (hunks.some(hunk => !hunk.status || hunk.status === 'pending')) return 'pending';
   return 'mixed';
+}
+
+function supersededDiffForPath(diff: FileDiffSummary, targets: string[], includeDescendants: boolean): boolean {
+  const keys = [
+    diff.path,
+    diff.reviewPath,
+    diffReviewIdentityPath(diff as DiffReviewPathCarrier),
+  ]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .map(value => normalizeReviewPath(value));
+  return keys.some(key => targets.some(target => (
+    key === target || (includeDescendants && key.startsWith(`${target}/`))
+  )));
+}
+
+function markDiffSuperseded(diff: FileDiffSummary, reviewError?: string): FileDiffSummary {
+  if (diff.status !== 'pending' && diff.status !== 'mixed') return diff;
+  return {
+    ...diff,
+    status: 'superseded',
+    reviewError: reviewError ?? diff.reviewError,
+  };
 }
 
 function markPendingEmptyHunkStatus(hunk: FileDiffHunk, status: NonNullable<FileDiffBlock['status']>): FileDiffHunk {
@@ -717,6 +773,7 @@ export const conversationSlice = createSlice({
       b.id = action.payload.id;
       b.title = action.payload.title;
       b.messages = action.payload.messages.map((m) => normalizeMessage(m, true, action.payload.id)); // restoring：恢复对话时收尾残留未完成态（防工具卡片永久转圈）
+      bumpMessageTopologyRevision(b);
       b.assistantRuns = normalizeAssistantRuns(action.payload.assistantRuns ?? {}, b.messages);
       b.fileSnapshots = action.payload.fileSnapshots ?? {};
       b.pendingDiffs = (action.payload.pendingDiffs ?? []).map(diff => normalizeDiff({ ...diff, conversationId: action.payload.id }));
@@ -733,7 +790,10 @@ export const conversationSlice = createSlice({
       // ★ M4-6-S4：换对话身份时回填 goal（'goal' in payload 才覆盖，含显式 undefined→清空；不带则不动）。
       if ('goal' in action.payload) b.goal = action.payload.goal || undefined;
       // ★ task_boundary：换对话身份时回填（'key' in payload 才覆盖，含显式 undefined→清空；不带则不动）。
-      if ('taskBoundaries' in action.payload) b.taskBoundaries = action.payload.taskBoundaries ?? undefined;
+      if ('taskBoundaries' in action.payload) {
+        b.taskBoundaries = action.payload.taskBoundaries ?? undefined;
+        bumpTaskBoundaryTopologyRevision(b);
+      }
       if ('taskHeadline' in action.payload) b.taskHeadline = action.payload.taskHeadline ?? undefined;
       // ★ M5-BPC：换对话身份时回填阈值覆盖（'key' in payload 才覆盖；number 用 typeof 判定，绝不用 `||` 吞 0）。
       if ('bpcThresholdOverride' in action.payload) {
@@ -808,12 +868,23 @@ export const conversationSlice = createSlice({
       b.goal = next || undefined;
     },
     // ★ task_boundary（Plan_5 §10）：开新任务边界，前一个 active 自动收为 done。新边界初始 history 含一条初始项。
-    beginTaskBoundary(state, action: PayloadAction<{ id: string; headline: string; summary?: string; anchorMessageId?: string; startRound?: number; at?: number; conversationId?: string }>) {
+    beginTaskBoundary(state, action: PayloadAction<{ id: string; headline: string; summary?: string; anchorMessageId?: string; continuationOfId?: string; continuationReason?: 'interrupt' | string; continuationIndex?: number; startRound?: number; at?: number; conversationId?: string }>) {
       const b = bucketOf(state, action.payload.conversationId);
       const now = action.payload.at ?? Date.now();
       if (!b.taskBoundaries) b.taskBoundaries = [];
+      const lastMessageId = b.messages[b.messages.length - 1]?.id;
+      const nextAnchorIndex = action.payload.anchorMessageId
+        ? b.messages.findIndex(message => message.id === action.payload.anchorMessageId)
+        : -1;
+      const previousMessageId = nextAnchorIndex > 0 ? b.messages[nextAnchorIndex - 1]?.id : undefined;
+      const previousBoundaryEndId = previousMessageId
+        ?? (lastMessageId !== action.payload.anchorMessageId ? lastMessageId : undefined);
       for (const tb of b.taskBoundaries) {
-        if (tb.status === 'active') { tb.status = 'done'; tb.endedAt = now; }
+        if (tb.status === 'active') {
+          tb.status = 'done';
+          tb.endedAt = now;
+          if (previousBoundaryEndId) tb.endAnchorMessageId = previousBoundaryEndId;
+        }
       }
       const headline = action.payload.headline;
       const summary = action.payload.summary ?? '';
@@ -823,11 +894,15 @@ export const conversationSlice = createSlice({
         status: 'active',
         startedAt: now,
         anchorMessageId: action.payload.anchorMessageId,
+        ...(action.payload.continuationOfId ? { continuationOfId: action.payload.continuationOfId } : {}),
+        ...(action.payload.continuationReason ? { continuationReason: action.payload.continuationReason } : {}),
+        ...(typeof action.payload.continuationIndex === 'number' ? { continuationIndex: action.payload.continuationIndex } : {}),
         startRound: action.payload.startRound,
         steps: [],
         history: [{ headline, summary, timestamp: now }],
       });
       b.taskHeadline = { headline, summary, updatedAt: now };
+      bumpTaskBoundaryTopologyRevision(b);
     },
     // ★ 设/更新顶部大标题+概述：刷镜像 + 给当前 active boundary.history push 一条（AI 每个小标题调一次）。
     //   无 active 时只刷镜像、不 push（history 无处挂，合理降级）。
@@ -865,7 +940,7 @@ export const conversationSlice = createSlice({
       });
     },
     // ★ 显式收口当前/指定边界（用户拍板：AI 显式调结束工具收口，不自动推断）。aborted=true 收为 'aborted'（红）。
-    endTaskBoundary(state, action: PayloadAction<{ id?: string; aborted?: boolean; at?: number; conversationId?: string } | undefined>) {
+    endTaskBoundary(state, action: PayloadAction<{ id?: string; status?: 'done' | 'interrupted' | 'aborted'; aborted?: boolean; at?: number; conversationId?: string } | undefined>) {
       const p = action.payload ?? {};
       const b = bucketOf(state, p.conversationId);
       const now = p.at ?? Date.now();
@@ -873,11 +948,16 @@ export const conversationSlice = createSlice({
         ? b.taskBoundaries?.find(tb => tb.id === p.id)
         : b.taskBoundaries?.find(tb => tb.status === 'active');
       if (!target) return;
-      target.status = p.aborted ? 'aborted' : 'done';
+      const previousStatus = target.status;
+      const previousEndAnchorMessageId = target.endAnchorMessageId;
+      target.status = p.status ?? (p.aborted ? 'aborted' : 'done');
       target.endedAt = now;
       // ★ 记录收口时刻最后一条消息 id 作为「吞消息」区间下界（卡片按 [anchor, endAnchor] 归组本边界期间的消息）。
       const lastMsg = b.messages[b.messages.length - 1];
       if (lastMsg) target.endAnchorMessageId = lastMsg.id;
+      if (target.status !== previousStatus || target.endAnchorMessageId !== previousEndAnchorMessageId) {
+        bumpTaskBoundaryTopologyRevision(b);
+      }
     },
     // ★ M5-BPC：设定 / 清空本对话【预压触发水位】覆盖（SettingsPanel 本对话覆盖入口 / 命令用）。
     //   合法有限 number → 设；undefined/NaN/非数字 → 清空（视为未覆盖，回退全局默认）。
@@ -914,6 +994,7 @@ export const conversationSlice = createSlice({
       const message: Message = isWrapped ? p.message : p;
       const b = bucketOf(state, isWrapped ? p.conversationId : undefined);
       b.messages.push(normalizeMessage(message));
+      bumpMessageTopologyRevision(b);
       if (message.role === 'user') invalidateTokenProjection(b, true);
     },
     updateMessage(state, action: PayloadAction<{ id: string; content: string; contentParts?: MessageContentPart[]; conversationId?: string }>) {
@@ -922,12 +1003,17 @@ export const conversationSlice = createSlice({
       if (msg) {
         msg.content = action.payload.content;
         msg.contentParts = action.payload.contentParts ?? textToContentParts(action.payload.content);
+        bumpMessageTopologyRevision(b);
       }
     },
     updateMessageMeta(state, action: PayloadAction<{ id: string; changes: Partial<Message>; conversationId?: string }>) {
       const b = bucketOf(state, action.payload.conversationId);
       const msg = b.messages.find(m => m.id === action.payload.id);
-      if (msg) Object.assign(msg, action.payload.changes);
+      if (msg) {
+        Object.assign(msg, action.payload.changes);
+        const topologyKeys: (keyof Message)[] = ['id', 'role', 'isStreaming', 'toolCalls', 'diffs', 'artifacts', 'attachments', 'subtitle', 'subtitleGeneratedAt'];
+        if (topologyKeys.some(key => key in action.payload.changes)) bumpMessageTopologyRevision(b);
+      }
     },
     appendMessageContent(state, action: PayloadAction<{ id: string; content: string; conversationId?: string }>) {
       const b = bucketOf(state, action.payload.conversationId);
@@ -947,7 +1033,10 @@ export const conversationSlice = createSlice({
     setMessageAttachments(state, action: PayloadAction<{ id: string; attachments: AttachmentRef[]; conversationId?: string }>) {
       const b = bucketOf(state, action.payload.conversationId);
       const msg = b.messages.find(m => m.id === action.payload.id);
-      if (msg) msg.attachments = action.payload.attachments;
+      if (msg) {
+        msg.attachments = action.payload.attachments;
+        bumpMessageTopologyRevision(b);
+      }
     },
     appendMessageThinking(state, action: PayloadAction<{ id: string; content: string; status?: ThinkingBlock['status']; conversationId?: string }>) {
       const b = bucketOf(state, action.payload.conversationId);
@@ -997,12 +1086,14 @@ export const conversationSlice = createSlice({
       const b = bucketOf(state, action.payload.conversationId);
       const msg = b.messages.find(m => m.id === action.payload.id);
       if (msg) {
+        const wasStreaming = msg.isStreaming;
         msg.streamState = action.payload.streamState;
         msg.isStreaming = action.payload.streamState === 'streaming' || action.payload.streamState === 'pending';
         if (action.payload.durationMs !== undefined) msg.durationMs = action.payload.durationMs;
         if (action.payload.error !== undefined) msg.error = action.payload.error;
         if (action.payload.streamMode !== undefined) msg.streamMode = action.payload.streamMode;
         if (action.payload.fallbackReason !== undefined) msg.fallbackReason = action.payload.fallbackReason;
+        if (wasStreaming !== msg.isStreaming) bumpMessageTopologyRevision(b);
       }
     },
     /**
@@ -1026,6 +1117,9 @@ export const conversationSlice = createSlice({
       const b = bucketOf(state, action.payload.conversationId);
       const incoming = action.payload.diff;
       const ownerMessage = b.messages.find(message => message.id === action.payload.messageId);
+      // Diff 必须永远附着于产生它的 assistant 消息。Stop/回溯竞态下若消息已被移除，
+      // 继续塞进 pendingDiffs 会生成无法解释来源、却可被接受/拒绝的孤儿审查项。
+      if (!ownerMessage) return;
       const ownerDiffIds = new Set(ownerMessage?.diffs?.map(diff => diff.id) ?? []);
       // afterContent 是合并重算所需的「本次最新落盘内容」，存储前剥除（不持久化全文件，避免落库膨胀）。
       const { afterContent, ...incomingRest } = incoming;
@@ -1064,6 +1158,7 @@ export const conversationSlice = createSlice({
             const di = m.diffs.findIndex(d => d.id === prev.id);
             if (di >= 0) m.diffs[di] = merged;
           }
+          bumpMessageTopologyRevision(b);
           return;
         }
       }
@@ -1074,9 +1169,8 @@ export const conversationSlice = createSlice({
         originalSnapshotId: incomingRest.originalSnapshotId ?? incomingRest.snapshotId,
         originalBeforeHash: incomingRest.originalBeforeHash ?? incomingRest.beforeHash,
       });
-      if (ownerMessage) {
-        ownerMessage.diffs = [...(ownerMessage.diffs ?? []), seeded];
-      }
+      ownerMessage.diffs = [...(ownerMessage.diffs ?? []), seeded];
+      bumpMessageTopologyRevision(b);
       b.pendingDiffs.push(seeded);
     },
     /**
@@ -1088,6 +1182,7 @@ export const conversationSlice = createSlice({
       const msg = b.messages.find(m => m.id === action.payload.messageId);
       if (msg) {
         msg.artifacts = [...(msg.artifacts ?? []), action.payload.artifact];
+        bumpMessageTopologyRevision(b);
       }
     },
     updateDiffStatus(state, action: PayloadAction<{ diffId: string; status: FileDiffSummary['status']; conversationId?: string }>) {
@@ -1131,6 +1226,25 @@ export const conversationSlice = createSlice({
       b.pendingDiffs = b.pendingDiffs.map(apply);
       for (const msg of b.messages) {
         if (msg.diffs) msg.diffs = msg.diffs.map(apply);
+      }
+    },
+    supersedeDiffsForPaths(state, action: PayloadAction<{ paths: string[]; conversationId?: string; includeDescendants?: boolean; reason?: string }>) {
+      const b = bucketOf(state, action.payload.conversationId);
+      const targets = action.payload.paths
+        .map(value => normalizeReviewPath(value))
+        .filter(value => value.length > 0);
+      if (targets.length === 0) return;
+      const includeDescendants = action.payload.includeDescendants === true;
+      const reason = action.payload.reason ?? '文件已被删除或移动，待审 Diff 已失效';
+      const apply = (diff: FileDiffSummary): FileDiffSummary => (
+        supersededDiffForPath(diff, targets, includeDescendants)
+          ? markDiffSuperseded(diff, reason)
+          : diff
+      );
+      b.pendingDiffs = b.pendingDiffs.map(apply);
+      for (const msg of b.messages) {
+        if (!msg.diffs) continue;
+        msg.diffs = msg.diffs.map(apply);
       }
     },
     updateHunkStatus(state, action: PayloadAction<{ diffId: string; hunkId: string; status: NonNullable<FileDiffBlock['status']>; conversationId?: string }>) {
@@ -1431,6 +1545,7 @@ export const conversationSlice = createSlice({
         const editTruncated = idx < b.messages.length - 1;
         b.messages = b.messages.slice(0, idx + 1);
         if (editTruncated) clampTaskBoundariesAfterTruncation(b);
+        bumpMessageTopologyRevision(b);
         invalidateTokenProjection(b, true);
       }
     },
@@ -1445,6 +1560,7 @@ export const conversationSlice = createSlice({
         const truncated = idx < b.messages.length - 1;
         b.messages = b.messages.slice(0, idx + 1);
         if (truncated) clampTaskBoundariesAfterTruncation(b);
+        if (truncated) bumpMessageTopologyRevision(b);
         if (truncated) invalidateTokenProjection(b, true);
       }
     },
@@ -1456,15 +1572,24 @@ export const conversationSlice = createSlice({
       const targetId = isObj ? (p as any).id : p;
       const previousLength = b.messages.length;
       b.messages = b.messages.filter(m => m.id !== targetId);
-      if (b.messages.length !== previousLength) invalidateTokenProjection(b, true);
+      if (b.messages.length !== previousLength) {
+        bumpMessageTopologyRevision(b);
+        invalidateTokenProjection(b, true);
+      }
       // ★ task_boundary：删消息可能删掉某边界的 anchor/endAnchor。清理引用被删消息的边界（anchor 没了整条丢弃，
       //   endAnchor 没了清下界）——但【不收口 active】：删单条不等于打断进行中任务（区别于回溯/编辑的整段截断）。
       if (b.taskBoundaries && b.taskBoundaries.length > 0) {
         const ids = new Set(b.messages.map(m => m.id));
+        const previousBoundaryCount = b.taskBoundaries.length;
         b.taskBoundaries = b.taskBoundaries.filter(tb => !tb.anchorMessageId || ids.has(tb.anchorMessageId));
+        let boundaryChanged = b.taskBoundaries.length !== previousBoundaryCount;
         for (const tb of b.taskBoundaries) {
-          if (tb.endAnchorMessageId && !ids.has(tb.endAnchorMessageId)) tb.endAnchorMessageId = undefined;
+          if (tb.endAnchorMessageId && !ids.has(tb.endAnchorMessageId)) {
+            tb.endAnchorMessageId = undefined;
+            boundaryChanged = true;
+          }
         }
+        if (boundaryChanged) bumpTaskBoundaryTopologyRevision(b);
       }
     },
     // ★ Plan_5 M5-3：清空所有消息（回溯到第 1 轮之前等「无任何消息保留」场景）。对话本体 id/title/goal
@@ -1472,6 +1597,7 @@ export const conversationSlice = createSlice({
     clearMessages(state, action: PayloadAction<{ conversationId?: string } | undefined>) {
       const b = bucketOf(state, action.payload?.conversationId);
       b.messages = [];
+      bumpMessageTopologyRevision(b);
       invalidateTokenProjection(b);
       // ★ task_boundary：消息归零 → 所有边界 anchor 都不在保留集 → clamp 自然全丢弃（防孤儿卡漂末尾）。
       clampTaskBoundariesAfterTruncation(b);
@@ -1572,10 +1698,15 @@ export const conversationSlice = createSlice({
         ));
         if (hasUnfinished) continue;
         const hasProblemTerminal = scopedTaskCalls.some(toolCall => toolCall.status !== 'success');
+        const previousStatus = boundary.status;
+        const previousEndAnchorMessageId = boundary.endAnchorMessageId;
         boundary.status = hasProblemTerminal ? 'aborted' : 'done';
         boundary.endedAt = now;
         const lastScopedMessage = bucket.messages[endIndex];
         if (lastScopedMessage && !boundary.endAnchorMessageId) boundary.endAnchorMessageId = lastScopedMessage.id;
+        if (boundary.status !== previousStatus || boundary.endAnchorMessageId !== previousEndAnchorMessageId) {
+          bumpTaskBoundaryTopologyRevision(bucket);
+        }
       }
     },
   },
@@ -1587,7 +1718,7 @@ export const {
   setBpcThresholdOverride, setCompactThresholdOverride, addMessage, updateMessage,
   updateMessageMeta, appendMessageContent, setMessageAttachments,
   appendMessageThinking, appendAssistantStreamFrame, setMessageStreamState, setMessageReconnect,
-  addMessageDiff, addMessageArtifact, updateDiffStatus, setDiffReviewError, updateHunkStatus, updateDiffBlockStatus, addAssistantRun, addRunEvent, resetRunStreamEvents, recordFileSnapshot,
+  addMessageDiff, addMessageArtifact, updateDiffStatus, setDiffReviewError, supersedeDiffsForPaths, updateHunkStatus, updateDiffBlockStatus, addAssistantRun, addRunEvent, resetRunStreamEvents, recordFileSnapshot,
   setStreaming, setCompacting, appendStreamingContent, clearStreamingContent,
   enqueueMessage, dequeueMessage, clearQueue,
   enqueueInterrupt, dequeueInterrupt, clearInterruptQueue, moveQueueItem,

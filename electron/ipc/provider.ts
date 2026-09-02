@@ -854,8 +854,9 @@ export function registerProviderHandlers(): void {
     ipcMain.handle('provider:windsurfStatus', () => windsurfController.status());
     ipcMain.handle('provider:windsurfLogin', () => windsurfController.start());
     ipcMain.handle('provider:windsurfComplete', (_event, transactionId: string, token: string) => windsurfController.complete(transactionId, token));
-    ipcMain.handle('provider:windsurfImportLocal', (event, options?: { confirmationToken?: string }) => windsurfController.importLocal({
+    ipcMain.handle('provider:windsurfImportLocal', (event, options?: { confirmationToken?: string; candidateFingerprint?: string }) => windsurfController.importLocal({
         confirmationToken: typeof options?.confirmationToken === 'string' ? options.confirmationToken : undefined,
+        candidateFingerprint: typeof options?.candidateFingerprint === 'string' ? options.candidateFingerprint : undefined,
         requesterId: event.sender.id,
     }));
     ipcMain.handle('provider:windsurfCancel', () => windsurfController.cancel());

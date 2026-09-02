@@ -105,10 +105,10 @@ export async function removeProviderCredential(
 
 export async function importLocalWindsurfCredential(
   dispatch: AppDispatch,
-  confirmationToken?: string,
+  options?: { confirmationToken?: string; candidateFingerprint?: string },
 ): Promise<{ result: WindsurfLocalImportResult; models: AIModelOption[]; catalogError: string | null }> {
   if (!platform.provider) throw new Error('本机 Windsurf/Devin 导入仅在 Synapse 桌面版可用');
-  const result = await platform.provider.windsurfImportLocal(confirmationToken ? { confirmationToken } : undefined);
+  const result = await platform.provider.windsurfImportLocal(options);
   await refreshProviderCredentialStatus(dispatch, 'windsurf');
   if (!result.ok) return { result, models: [], catalogError: null };
   const epoch = beginProviderCatalogRefresh('windsurf');

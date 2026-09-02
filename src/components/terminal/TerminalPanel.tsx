@@ -1,6 +1,8 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { Terminal as TerminalIcon, Plus, Square, X } from 'lucide-react';
 import { isElectron } from '@platform/index';
+import { useAppSelector } from '@/store/hooks';
+import type { RootState } from '@/store';
 
 interface TerminalTab {
   id: string;
@@ -20,6 +22,12 @@ export function TerminalPanel() {
   const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const outputRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const currentWorkspacePath = useAppSelector((state: RootState) => state.workspace.currentPath);
+  const terminalCwd = currentWorkspacePath
+    && currentWorkspacePath !== '/workspace'
+    && !currentWorkspacePath.startsWith('/workspace/')
+    ? currentWorkspacePath
+    : undefined;
 
   const currentTab = tabs.find(t => t.id === activeTab) || tabs[0];
 
@@ -40,10 +48,6 @@ export function TerminalPanel() {
       setActiveTab(tabs[0]?.id || 'default');
     }
   }, [activeTab, tabs]);
-
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, [activeTab]);
 
   useEffect(() => {
     const focus = () => inputRef.current?.focus();
@@ -116,7 +120,7 @@ export function TerminalPanel() {
         } else if (cmd === 'date') {
           newOutput.push(new Date().toLocaleString('zh-CN'));
         } else if (cmd === 'pwd') {
-          newOutput.push('/workspace');
+          newOutput.push(terminalCwd || '/workspace');
         } else if (cmd.startsWith('cat ')) {
           const file = cmd.slice(4).trim();
           newOutput.push(`[Web 模式] 显示文件: ${file}`);
@@ -138,7 +142,7 @@ export function TerminalPanel() {
         return { ...t, output: newOutput };
       }));
     } else if (window.synapse?.command) {
-      appendOutput(tabId, [`$ ${cmd}`, '执行中...']);
+      appendOutput(tabId, [`$ ${cmd}`, '等待安全确认…']);
       const ownerId = `terminal:${tabId}`;
       const commandTimestamp = Date.now();
       const conversationId = `terminal:${tabId}`;
@@ -152,6 +156,7 @@ export function TerminalPanel() {
       try {
         started = await window.synapse.command.start({
           command: cmd,
+          cwd: terminalCwd,
           taskId,
           conversationId,
           runId,
@@ -165,6 +170,7 @@ export function TerminalPanel() {
         appendOutput(tabId, [`命令未启动：${(error as Error)?.message ?? error}`, 'synapse $']);
         return;
       }
+      appendOutput(tabId, ['命令已启动…']);
       let result = started;
       let shownStdout = '';
       let shownStderr = '';
@@ -215,7 +221,7 @@ export function TerminalPanel() {
         outputRef.current.scrollTop = outputRef.current.scrollHeight;
       }
     }, 50);
-  }, [input, activeTab, history, appendOutput]);
+  }, [input, activeTab, history, appendOutput, terminalCwd]);
 
   return (
     <div className="terminal-panel">
@@ -224,7 +230,10 @@ export function TerminalPanel() {
           <div
             key={tab.id}
             className={`terminal-tab ${activeTab === tab.id ? 'active' : ''}`}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => {
+              setActiveTab(tab.id);
+              window.setTimeout(() => inputRef.current?.focus(), 0);
+            }}
           >
             <TerminalIcon size={12} />
             <span>{tab.name}</span>
@@ -296,7 +305,6 @@ export function TerminalPanel() {
             }
           }}
           placeholder={isElectron ? '输入命令...' : '输入命令（Web 模式限制）'}
-          autoFocus
           disabled={Boolean(currentTab.runningTaskId)}
         />
       </form>

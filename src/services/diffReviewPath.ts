@@ -3,6 +3,7 @@ import { getWorkspaceRootResolved, resolveCanonicalWorkspacePath } from './fileS
 export interface DiffReviewPathCarrier {
   path: string;
   reviewPath?: string;
+  workspaceRoot?: string | null;
   contextId?: string;
   conversationId?: string;
 }
@@ -10,6 +11,7 @@ export interface DiffReviewPathCarrier {
 export interface DiffReviewPathResolution {
   reviewPath: string;
   resolvedPath: string;
+  workspaceRoot: string | null;
   isWorkspaceRelative: boolean;
 }
 
@@ -72,6 +74,21 @@ export function normalizeDiffPath(filePath: string, caseInsensitive = true): str
   return caseInsensitive ? normalized.toLowerCase() : normalized;
 }
 
+function isAbsoluteReviewPath(filePath: string): boolean {
+  const normalized = normalizeSeparators(filePath);
+  return /^[A-Za-z]:\//.test(normalized) || normalized.startsWith('/') || normalized.startsWith('//');
+}
+
+function inferredWorkspaceRoot(diff: DiffReviewPathCarrier, reviewPath: string): string | null {
+  if (diff.workspaceRoot && diff.workspaceRoot.trim()) return normalizeDiffPath(diff.workspaceRoot);
+  if (!diff.path || !reviewPath || isAbsoluteReviewPath(reviewPath) || !isAbsoluteReviewPath(diff.path)) return null;
+  const absolutePath = normalizeDiffPath(diff.path);
+  const relativePath = normalizeDiffPath(reviewPath).replace(/^\.\//, '');
+  if (!relativePath || relativePath === '.') return absolutePath;
+  const suffix = `/${relativePath}`;
+  return absolutePath.endsWith(suffix) ? absolutePath.slice(0, -suffix.length) : null;
+}
+
 function workspaceRelativeReviewPath(
   resolvedPath: string,
   workspaceRoot: string,
@@ -100,6 +117,7 @@ export async function resolveDiffReviewPath(
   return {
     resolvedPath,
     reviewPath: relativeReviewPath ?? normalizeDiffPath(resolvedPath, caseInsensitive),
+    workspaceRoot,
     isWorkspaceRelative: relativeReviewPath !== null,
   };
 }
@@ -108,5 +126,9 @@ export function diffReviewIdentityPath(diff: DiffReviewPathCarrier): string {
   const reviewPath = typeof diff.reviewPath === 'string' && diff.reviewPath.trim()
     ? diff.reviewPath
     : diff.path;
-  return normalizeDiffPath(reviewPath);
+  const normalizedReviewPath = normalizeDiffPath(reviewPath);
+  const root = inferredWorkspaceRoot(diff, reviewPath);
+  if (root && !isAbsoluteReviewPath(reviewPath)) return `${root}::${normalizedReviewPath}`;
+  if (isAbsoluteReviewPath(diff.path)) return normalizeDiffPath(diff.path);
+  return normalizedReviewPath;
 }

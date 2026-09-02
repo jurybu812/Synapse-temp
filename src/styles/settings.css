@@ -667,6 +667,67 @@
 .permission-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .permission-active-warning { color: #f59e0b; }
 
+.windsurf-import-candidates {
+  flex: 1 1 calc(100% - 104px);
+  min-width: 0;
+  margin: 0 0 0 104px;
+  padding: 10px;
+  border: 1px solid var(--syn-border);
+  border-radius: 8px;
+  background: var(--syn-bg-elevated);
+}
+
+.windsurf-import-candidates legend {
+  padding: 0 5px;
+  color: var(--syn-text-secondary);
+  font-size: 11px;
+}
+
+.setting-item .windsurf-import-candidate {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 8px;
+  border-radius: 6px;
+  color: var(--syn-text-primary);
+  cursor: pointer;
+}
+
+.setting-item .windsurf-import-candidate:hover {
+  background: var(--syn-bg-hover);
+}
+
+.windsurf-import-candidate input {
+  margin: 2px 0 0;
+  accent-color: var(--syn-primary);
+}
+
+.windsurf-import-candidate-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  overflow-wrap: anywhere;
+}
+
+.windsurf-import-candidate-copy strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.windsurf-import-candidate-copy small {
+  color: var(--syn-text-muted);
+  font-size: 11px;
+}
+
+.windsurf-import-candidate-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 4px;
+}
+
 @media (max-width: 560px) {
   .settings-tabs-shell {
     gap: 4px;
@@ -700,6 +761,11 @@
 
   .plugin-action {
     margin-left: 26px;
+  }
+
+  .windsurf-import-candidates {
+    flex-basis: 100%;
+    margin-left: 0;
   }
 
   .multi-ai-mode {

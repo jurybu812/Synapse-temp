@@ -1,13 +1,13 @@
 {
   "schemaVersion": 3,
-  "generatedAtUtc": "2026-09-02T15:23:17.471Z",
+  "generatedAtUtc": "2026-09-02T15:37:03.032Z",
   "sourceSnapshot": {
-    "sourceHead": "229ebb1bb7f1854aea17cc18e14d9aea7610d785",
+    "sourceHead": "43881307610747b81f929d7d52fcc520ab2e34bd",
     "sourceDirty": false,
     "sourceStatusSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "sourceTrackedFileCount": 300,
-    "sourceFileSetSha256": "d0bdda59f7a7a191c35537631d3005617b8c062c64cfa4ce15e2a7befb6de3dd",
-    "targetFileSetSha256": "d0bdda59f7a7a191c35537631d3005617b8c062c64cfa4ce15e2a7befb6de3dd",
+    "sourceFileSetSha256": "a5a949f81d6dc199ba3074805d796cb59e6b56a9a808879115b59de3af38bee0",
+    "targetFileSetSha256": "a5a949f81d6dc199ba3074805d796cb59e6b56a9a808879115b59de3af38bee0",
     "exportScriptSha256": "1be800dc3e15b106434e723b5b531ac268859f531512e596af16821ae5cdd067"
   },
   "files": [
@@ -398,8 +398,8 @@
     },
     {
       "path": "scripts/generate-third-party-notices.cjs",
-      "bytes": 7248,
-      "sha256": "608d4cb140e9598cf79be686a7e06aba7e0756c294b3c859d16d206621e498a0"
+      "bytes": 7840,
+      "sha256": "59bef64cae8d13ae155413987614badc2130dfa917aefdc9dfd8df50951e1a80"
     },
     {
       "path": "scripts/html-viewer-safety.integration.cjs",
@@ -1478,8 +1478,8 @@
     },
     {
       "path": "THIRD_PARTY_NOTICES.md",
-      "bytes": 42238,
-      "sha256": "163fa70b4db4d04d9fd8195b8b8e0c20379432530eb43230322e88680757bea7"
+      "bytes": 42248,
+      "sha256": "e576e1586aa682377252d06faeaa92b56465b9b21d1315f6de0ccdd5ce7a926d"
     },
     {
       "path": "tsconfig.app.json",

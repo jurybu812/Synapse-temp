@@ -51,6 +51,10 @@ function sha256(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
+function sha256Buffer(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
 function runGit(args, options = {}) {
   const { allowFailure = false, encoding = 'utf8' } = options;
   try {
@@ -74,6 +78,11 @@ function runGit(args, options = {}) {
 function readGitLines(args) {
   const result = runGit(args);
   return result.output.split(/\r?\n/).filter(Boolean);
+}
+
+function readCommittedFile(itemPath, fallbackPath) {
+  const result = runGit(['show', `HEAD:${itemPath}`], { allowFailure: true, encoding: null });
+  return result.ok && Buffer.isBuffer(result.output) ? result.output : fs.readFileSync(fallbackPath);
 }
 
 function resolveManifestFile(itemPath) {
@@ -246,7 +255,8 @@ if (fs.statSync(manifestPath, { throwIfNoEntry: false })?.isFile()) {
       failures.push(`Invalid manifest metadata: ${itemPath}`);
       continue;
     }
-    if (fs.statSync(filePath).size !== item.bytes || sha256(filePath) !== item.sha256) failures.push(`Manifest mismatch: ${itemPath}`);
+    const committedBuffer = readCommittedFile(itemPath, filePath);
+    if (committedBuffer.length !== item.bytes || sha256Buffer(committedBuffer) !== item.sha256) failures.push(`Manifest mismatch: ${itemPath}`);
   }
   const computedFileSetSha256 = crypto.createHash('sha256').update(JSON.stringify(manifestFiles)).digest('hex');
   if (snapshot?.sourceFileSetSha256 !== computedFileSetSha256) failures.push('Manifest source file-set hash does not match files');
@@ -254,7 +264,7 @@ if (fs.statSync(manifestPath, { throwIfNoEntry: false })?.isFile()) {
   if (snapshot?.sourceTrackedFileCount !== manifestFiles.length) failures.push('Manifest tracked file count does not match files');
   const exportedScriptPath = path.join(root, 'scripts', 'export-anonymous-submission.cjs');
   if (fs.statSync(exportedScriptPath, { throwIfNoEntry: false })?.isFile()
-    && snapshot?.exportScriptSha256 !== sha256(exportedScriptPath)) failures.push('Manifest export-script hash does not match exporter');
+    && snapshot?.exportScriptSha256 !== sha256Buffer(readCommittedFile('scripts/export-anonymous-submission.cjs', exportedScriptPath))) failures.push('Manifest export-script hash does not match exporter');
   for (const filePath of files) {
     const fileName = relative(filePath);
     if (fileName !== 'SUBMISSION_MANIFEST.json' && !manifestPaths.has(fileName)) failures.push(`File missing from manifest: ${fileName}`);

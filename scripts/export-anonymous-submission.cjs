@@ -254,6 +254,7 @@ function replaceDirectoryTransactional(targetRoot, stagingRoot, backupRoot) {
 
 function initializeAnonymousRepository(stagingRoot) {
   runGit(['init', '--initial-branch=main'], stagingRoot);
+  runGit(['config', 'core.autocrlf', 'false'], stagingRoot);
   runGit(['config', 'user.name', 'Synapse Project'], stagingRoot);
   runGit(['config', 'user.email', 'synapse-project@users.noreply.github.com'], stagingRoot);
   runGit(['add', '--all'], stagingRoot);

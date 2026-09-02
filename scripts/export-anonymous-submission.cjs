@@ -202,6 +202,29 @@ function collectTrackedSourceFiles() {
   });
 }
 
+function collectCommittedSourceFiles() {
+  const output = runGit(['ls-files', '-z', '--', ...rootFiles, ...rootDirectories], sourceRoot, null);
+  const trackedPaths = output.toString('utf8').split('\0').filter(Boolean).sort((left, right) => left.localeCompare(right));
+  const trackedSet = new Set(trackedPaths);
+  for (const fileName of rootFiles) {
+    if (!trackedSet.has(fileName)) throw new Error(`Required source file is not tracked by Git: ${fileName}`);
+  }
+  for (const directoryName of rootDirectories) {
+    if (!trackedPaths.some(fileName => fileName.startsWith(`${directoryName}/`))) {
+      throw new Error(`Required source directory has no tracked files: ${directoryName}`);
+    }
+  }
+  return trackedPaths.map(relativePath => {
+    if (!isAllowedTrackedPath(relativePath)) throw new Error(`Tracked path is outside the submission allowlist: ${relativePath}`);
+    const buffer = runGit(['show', `HEAD:${relativePath}`], sourceRoot, null);
+    return {
+      path: relativePath,
+      bytes: buffer.length,
+      sha256: crypto.createHash('sha256').update(buffer).digest('hex'),
+    };
+  });
+}
+
 function copyTrackedFiles(files, targetRoot) {
   for (const item of files) {
     const sourcePath = path.join(sourceRoot, ...item.path.split('/'));
@@ -238,7 +261,7 @@ function refreshSourceManifest() {
   if (initialGitState.sourceDirty) {
     throw new Error('Manifest refresh requires a clean source worktree; commit verified source changes first');
   }
-  const sourceFiles = collectTrackedSourceFiles();
+  const sourceFiles = collectCommittedSourceFiles();
   const sourceFileSetSha256 = hashJson(sourceFiles);
   const manifest = {
     schemaVersion: 3,
@@ -248,7 +271,9 @@ function refreshSourceManifest() {
       sourceTrackedFileCount: sourceFiles.length,
       sourceFileSetSha256,
       targetFileSetSha256: sourceFileSetSha256,
-      exportScriptSha256: sha256(__filename),
+      exportScriptSha256: crypto.createHash('sha256')
+        .update(runGit(['show', 'HEAD:scripts/export-anonymous-submission.cjs'], sourceRoot, null))
+        .digest('hex'),
     },
     files: sourceFiles,
   };
